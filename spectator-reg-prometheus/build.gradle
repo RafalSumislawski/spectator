@@ -1,0 +1,13 @@
+dependencies {
+  compileApi project(':spectator-api')
+  compileApi 'io.prometheus:simpleclient:0.6.0'
+  jmh project(':spectator-api')
+}
+
+jar {
+  manifest {
+    attributes(
+      "Automatic-Module-Name": "com.netflix.spectator.prometheus"
+    )
+  }
+}
