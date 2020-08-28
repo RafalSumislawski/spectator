@@ -1,7 +1,6 @@
 dependencies {
-  compileApi project(':spectator-api')
-  compileApi 'io.prometheus:simpleclient:0.6.0'
-  jmh project(':spectator-api')
+  api project(':spectator-api')
+  implementation 'io.prometheus:simpleclient:0.9.0'
 }
 
 jar {

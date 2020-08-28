@@ -25,9 +25,9 @@ class PrometheusGauge implements com.netflix.spectator.api.Gauge {
 
   private final Clock clock;
   private final Id id;
-  private final io.prometheus.client.Gauge impl;
+  private final io.prometheus.client.Gauge.Child impl;
 
-  PrometheusGauge(Clock clock, Id id, io.prometheus.client.Gauge impl) {
+  PrometheusGauge(Clock clock, Id id, io.prometheus.client.Gauge.Child impl) {
     this.clock = clock;
     this.id = id;
     this.impl = impl;

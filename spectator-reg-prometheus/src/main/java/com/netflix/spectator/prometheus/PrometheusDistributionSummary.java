@@ -28,10 +28,10 @@ class PrometheusDistributionSummary implements DistributionSummary {
 
   private final Clock clock;
   private final Id id;
-  private final io.prometheus.client.Summary impl;
+  private final io.prometheus.client.Summary.Child impl;
 
   /** Create a new instance. */
-  PrometheusDistributionSummary(Clock clock, Id id, io.prometheus.client.Summary impl) {
+  PrometheusDistributionSummary(Clock clock, Id id, io.prometheus.client.Summary.Child impl) {
     this.clock = clock;
     this.id = id;
     this.impl = impl;

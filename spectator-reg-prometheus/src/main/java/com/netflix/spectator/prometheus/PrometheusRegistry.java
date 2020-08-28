@@ -15,66 +15,82 @@
  */
 package com.netflix.spectator.prometheus;
 
-import com.netflix.spectator.api.AbstractRegistry;
-import com.netflix.spectator.api.Clock;
-import com.netflix.spectator.api.Counter;
-import com.netflix.spectator.api.DistributionSummary;
-import com.netflix.spectator.api.Gauge;
-import com.netflix.spectator.api.Id;
-import com.netflix.spectator.api.Tag;
-import com.netflix.spectator.api.Timer;
+import com.netflix.spectator.api.*;
 import io.prometheus.client.SimpleCollector;
 
-import java.util.ArrayList;
-import java.util.List;
-
-/** Registry implementation that maps spectator types to the prometheus simple client library. */
+/**
+ * Registry implementation that maps spectator types to the prometheus simple client library.
+ */
 public class PrometheusRegistry extends AbstractRegistry {
 
-  private final io.prometheus.client.CollectorRegistry impl;
+    private final io.prometheus.client.CollectorRegistry impl;
 
-  /** Create a new instance. */
-  public PrometheusRegistry() {
-    this(Clock.SYSTEM, io.prometheus.client.CollectorRegistry.defaultRegistry);
-  }
+    /**
+     * Create a new instance.
+     */
+    public PrometheusRegistry() {
+        this(Clock.SYSTEM, io.prometheus.client.CollectorRegistry.defaultRegistry);
+    }
 
-  /** Create a new instance. */
-  public PrometheusRegistry(Clock clock, io.prometheus.client.CollectorRegistry impl) {
-    super(clock);
-    this.impl = impl;
-  }
+    /**
+     * Create a new instance.
+     */
+    public PrometheusRegistry(Clock clock, io.prometheus.client.CollectorRegistry impl) {
+        super(clock);
+        this.impl = impl;
+    }
 
-  private String tagToLabel(Tag tag){
-    return tag.key() + "_" + tag.value();
-  }
+    @Override
+    protected Counter newCounter(Id id) {
+        return new PrometheusCounter(clock(), id, build(io.prometheus.client.Counter.build(), id));
+    }
 
-  private String[] tagsToLabels(Iterable<Tag> tags){
-    List<String> l = new ArrayList<>();
-    tags.forEach((t) -> l.add(tagToLabel(t)));
-    return l.toArray(new String[l.size()]);
-  }
+    @Override
+    protected DistributionSummary newDistributionSummary(Id id) {
+        return new PrometheusDistributionSummary(clock(), id, build(io.prometheus.client.Summary.build(), id));
+    }
 
-  private <B extends SimpleCollector.Builder<B, C>, C extends SimpleCollector> C build(B builder, Id id){
-    return builder.name(id.name()).help(id.name()).labelNames(tagsToLabels(id.tags())).register(impl);
-  }
+    @Override
+    protected Timer newTimer(Id id) {
+        return new PrometheusTimer(clock(), id, build(io.prometheus.client.Summary.build(), id));
+    }
 
-  @Override protected Counter newCounter(Id id) {
-    return new PrometheusCounter(clock(), id, build(io.prometheus.client.Counter.build(), id));
-  }
+    @Override
+    protected Gauge newGauge(Id id) {
+        return new PrometheusGauge(clock(), id, build(io.prometheus.client.Gauge.build(), id));
+    }
 
-  @Override protected DistributionSummary newDistributionSummary(Id id) {
-    return new PrometheusDistributionSummary(clock(), id, build(io.prometheus.client.Summary.build(), id));
-  }
+    @Override
+    protected Gauge newMaxGauge(Id id) {
+        return new PrometheusGauge(clock(), id, build(io.prometheus.client.Gauge.build(), id)); // FIXME this is incorrect behaviour. Unfortunatelly it's hard to implement a proper MaxGauge with prometheus.
+    }
 
-  @Override protected Timer newTimer(Id id) {
-    return new PrometheusTimer(clock(), id, build(io.prometheus.client.Summary.build(), id));
-  }
+    private <B extends SimpleCollector.Builder<B, C>, C extends SimpleCollector<D>, D> D build(B builder, Id id) {
+        return builder
+                .name(id.name())
+                .help(id.name())
+                .labelNames(labelNames(id))
+                .register(impl)
+                .labels(labelValues(id));
+    }
 
-  @Override protected Gauge newGauge(Id id) {
-    return new PrometheusGauge(clock(), id, build(io.prometheus.client.Gauge.build(), id));
-  }
+    private String[] labelNames(Id id) {
+        String[] labelNames = new String[id.size() - 1];
+        int i = 0;
+        for (Tag tag : id.tags()) {
+            labelNames[i] = tag.key();
+            i++;
+        }
+        return labelNames;
+    }
 
-  @Override protected Gauge newMaxGauge(Id id) {
-    return new PrometheusGauge(clock(), id, build(io.prometheus.client.Gauge.build(), id)); // FIXME this is incorrect behaviour. Unfortunatelly it's hard to implement a proper MaxGauge with prometheus.
-  }
+    private String[] labelValues(Id id) {
+        String[] labelValues = new String[id.size() - 1];
+        int i = 0;
+        for (Tag tag : id.tags()) {
+            labelValues[i] = tag.value();
+            i++;
+        }
+        return labelValues;
+    }
 }

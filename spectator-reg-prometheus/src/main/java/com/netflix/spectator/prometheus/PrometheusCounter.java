@@ -27,10 +27,10 @@ class PrometheusCounter implements Counter {
 
   private final Clock clock;
   private final Id id;
-  private final io.prometheus.client.Counter impl;
+  private final io.prometheus.client.Counter.Child impl;
 
   /** Create a new instance. */
-  PrometheusCounter(Clock clock, Id id, io.prometheus.client.Counter impl) {
+  PrometheusCounter(Clock clock, Id id, io.prometheus.client.Counter.Child impl) {
     this.clock = clock;
     this.id = id;
     this.impl = impl;

@@ -30,10 +30,10 @@ import java.util.concurrent.atomic.AtomicLong;
 class PrometheusTimer extends AbstractTimer {
 
   private final Id id;
-  private final io.prometheus.client.Summary impl;
+  private final io.prometheus.client.Summary.Child impl;
 
   /** Create a new instance. */
-  PrometheusTimer(Clock clock, Id id, io.prometheus.client.Summary impl) {
+  PrometheusTimer(Clock clock, Id id, io.prometheus.client.Summary.Child impl) {
     super(clock);
     this.id = id;
     this.impl = impl;
