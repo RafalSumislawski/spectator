@@ -113,12 +113,49 @@ public final class Utils {
   public static String getTagValue(Iterable<Tag> tags, String k) {
     Preconditions.checkNotNull(tags, "tags");
     Preconditions.checkNotNull(k, "key");
-    for (Tag t : tags) {
-      if (k.equals(t.key())) {
-        return t.value();
+    if (tags instanceof TagList) {
+      TagList list = (TagList) tags;
+      int n = list.size();
+      for (int i = 0; i < n; ++i) {
+        if (k.equals(list.getKey(i))) {
+          return list.getValue(i);
+        }
+      }
+    } else {
+      for (Tag t : tags) {
+        if (k.equals(t.key())) {
+          return t.value();
+        }
       }
     }
     return null;
+  }
+
+  /**
+   * Return the value at a given position in the iterable.
+   *
+   * @param values
+   *     A collection of values. For deterministic behavior the iteration order of the
+   *     container type must be consistent each time.
+   * @param pos
+   *     Position of the value to extract.
+   * @return
+   *     Value at the given position.
+   */
+  public static <T> T getValue(Iterable<T> values, int pos) {
+    if (values instanceof List) {
+      List<T> vs = (List<T>) values;
+      return vs.get(pos);
+    } else {
+      int i = 0;
+      for (T v : values) {
+        if (i == pos) {
+          return v;
+        }
+        ++i;
+      }
+      throw new IndexOutOfBoundsException(pos + " >= " + i);
+    }
   }
 
   /**
@@ -241,8 +278,8 @@ public final class Utils {
    */
   @SuppressWarnings("PMD.UnusedLocalVariable")
   public static <T> int size(Iterable<T> iter) {
-    if (iter instanceof ArrayTagSet) {
-      return ((ArrayTagSet) iter).size();
+    if (iter instanceof TagList) {
+      return ((TagList) iter).size();
     } else if (iter instanceof Collection<?>) {
       return ((Collection<?>) iter).size();
     } else {

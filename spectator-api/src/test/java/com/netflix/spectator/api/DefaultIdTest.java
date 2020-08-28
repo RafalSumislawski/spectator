@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,8 +21,10 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.nio.file.AccessMode;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -202,7 +204,7 @@ public class DefaultIdTest {
   @Test
   public void withTagEnumNull() {
     Assertions.assertThrows(NullPointerException.class, () -> {
-      Enum value = null;
+      Enum<?> value = null;
       new DefaultId("test").withTag("enum", value);
     });
   }
@@ -249,5 +251,56 @@ public class DefaultIdTest {
 
     Assertions.assertEquals(id1.hashCode(), id2.hashCode());
     Assertions.assertEquals(id1, id2);
+  }
+
+  @Test
+  public void tagListIterator() {
+    List<Tag> expected = new ArrayList<>();
+    expected.add(Tag.of("name", "foo"));
+    expected.add(Tag.of("k1", "v1"));
+    expected.add(Tag.of("k2", "v2"));
+
+    DefaultId id = (new DefaultId("foo")).withTag("k1", "v1").withTag("k2", "v2");
+    List<Tag> actual = new ArrayList<>();
+    for (Tag t : id) {
+      actual.add(t);
+    }
+
+    Assertions.assertEquals(expected, actual);
+  }
+
+  @Test
+  public void tagListForEach() {
+    List<Tag> expected = new ArrayList<>();
+    expected.add(Tag.of("name", "foo"));
+    expected.add(Tag.of("k1", "v1"));
+    expected.add(Tag.of("k2", "v2"));
+
+    DefaultId id = (new DefaultId("foo")).withTag("k1", "v1").withTag("k2", "v2");
+    List<Tag> actual = new ArrayList<>();
+    id.forEach((k, v) -> actual.add(Tag.of(k, v)));
+
+    Assertions.assertEquals(expected, actual);
+  }
+
+  @Test
+  public void tagListFilter() {
+    DefaultId id = new DefaultId("foo", ArrayTagSet.create("a", "1", "b", "2"));
+    Id expected = Id.create("foo").withTag("a", "1");
+    Assertions.assertEquals(expected, id.filter((k, v) -> !k.equals("b")));
+  }
+
+  @Test
+  public void tagListFilterByKey() {
+    DefaultId id = new DefaultId("foo", ArrayTagSet.create("a", "1", "b", "2"));
+    Id expected = Id.create("foo").withTag("a", "1");
+    Assertions.assertEquals(expected, id.filterByKey(k -> !k.equals("b")));
+  }
+
+  @Test
+  public void tagListFilterByKeyName() {
+    // Name is required and is ignored for filtering
+    DefaultId id = new DefaultId("foo", ArrayTagSet.create("a", "1", "b", "2"));
+    Assertions.assertEquals(id, id.filterByKey(k -> !k.equals("name")));
   }
 }

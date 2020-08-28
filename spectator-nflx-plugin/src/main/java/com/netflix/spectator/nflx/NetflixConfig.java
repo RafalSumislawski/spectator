@@ -76,8 +76,9 @@ public final class NetflixConfig {
     }
   }
 
-  private static Config loadPropFiles() {
+  static Config loadPropFiles() {
     final Properties props = new Properties();
+    Env.addDefaults(props);
     final String env = Env.environment();
     final String acctId = Env.accountId();
     tryLoadingConfig(props, "atlas_plugin");
@@ -104,7 +105,10 @@ public final class NetflixConfig {
 
   private static void put(Map<String, String> map, String key, String maybeNullValue) {
     if (maybeNullValue != null) {
-      map.put(key, maybeNullValue);
+      String value = maybeNullValue.trim();
+      if (!value.isEmpty()) {
+        map.put(key, maybeNullValue);
+      }
     }
   }
 
@@ -118,6 +122,8 @@ public final class NetflixConfig {
     put(commonTags, "nf.cluster", Env.cluster());
     put(commonTags, "nf.asg", Env.asg());
     put(commonTags, "nf.stack", Env.stack());
+    put(commonTags, "nf.shard1", Env.shard1());
+    put(commonTags, "nf.shard2", Env.shard2());
     put(commonTags, "nf.zone", Env.zone());
     put(commonTags, "nf.vmtype", Env.vmtype());
     put(commonTags, "nf.node", Env.instanceId());
@@ -140,6 +146,8 @@ public final class NetflixConfig {
     private static final String CLUSTER = "NETFLIX_CLUSTER";
     private static final String ASG = "NETFLIX_AUTO_SCALE_GROUP";
     private static final String STACK = "NETFLIX_STACK";
+    private static final String SHARD1 = "NETFLIX_SHARD1";
+    private static final String SHARD2 = "NETFLIX_SHARD2";
 
     private static final String TASK = "TITUS_TASK_ID";
     private static final String JOB = "TITUS_JOB_ID";
@@ -151,11 +159,11 @@ public final class NetflixConfig {
     }
 
     private static String environment() {
-      return getenv(ENVIRONMENT, "dev");
+      return getenv(ENVIRONMENT, "test");
     }
 
     private static String accountId() {
-      return getenv(OWNER, "dc");
+      return getenv(OWNER, "unknown");
     }
 
     private static String region() {
@@ -190,6 +198,14 @@ public final class NetflixConfig {
       return System.getenv(STACK);
     }
 
+    private static String shard1() {
+      return System.getenv(SHARD1);
+    }
+
+    private static String shard2() {
+      return System.getenv(SHARD2);
+    }
+
     private static String vmtype() {
       return System.getenv(VM_TYPE);
     }
@@ -205,6 +221,19 @@ public final class NetflixConfig {
       } catch (UnknownHostException e) {
         throw new RuntimeException(e);
       }
+    }
+
+    /**
+     * Set default values for environment variables that are used for the basic context
+     * of where an app is running. Helps avoid startup issues when running locally and
+     * these are not set.
+     */
+    private static void addDefaults(Properties props) {
+      props.put(ENVIRONMENT, "test");
+      props.put(OWNER, "unknown");
+      props.put(REGION, "us-east-1");
+      props.put(APP, "local");
+      props.put(CLUSTER, "local-dev");
     }
   }
 }

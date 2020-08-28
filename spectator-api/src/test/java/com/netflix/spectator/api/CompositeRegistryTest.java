@@ -255,8 +255,7 @@ public class CompositeRegistryTest {
 
     Registry r1 = new DefaultRegistry(clock);
     r.add(r1);
-    // depends on registry type, some will be expired until first increment
-    Assertions.assertFalse(c1.hasExpired());
+    Assertions.assertTrue(c1.hasExpired());
 
     c1.increment();
     Assertions.assertFalse(c1.hasExpired());
@@ -314,5 +313,42 @@ public class CompositeRegistryTest {
     r.gauge(r.createId("b")).set(2.0);
     Assertions.assertEquals(2, r.gauges().count());
     Assertions.assertEquals(2, r.stream().filter(m -> m instanceof Gauge).count());
+  }
+
+  @Test
+  public void dedupAddedRegistries() {
+    CompositeRegistry registry = new CompositeRegistry(clock);
+    Registry r = new DefaultRegistry();
+    registry.add(r);
+    registry.add(r);
+    registry.counter("test").increment();
+    Assertions.assertEquals(1, r.counter("test").count());
+  }
+
+  @Test
+  public void meterLookupAfterRegistryChange() {
+    CompositeRegistry r = new CompositeRegistry(clock);
+    Registry r1 = new DefaultRegistry(clock);
+    Registry r2 = new DefaultRegistry(clock);
+
+    Counter c = r.counter("test");
+    c.increment();
+    Assertions.assertEquals(0, r1.counter("test").count());
+    Assertions.assertEquals(0, r2.counter("test").count());
+
+    r.add(r1);
+    c.increment();
+    Assertions.assertEquals(1, r1.counter("test").count());
+    Assertions.assertEquals(0, r2.counter("test").count());
+
+    r.add(r2);
+    c.increment();
+    Assertions.assertEquals(2, r1.counter("test").count());
+    Assertions.assertEquals(1, r2.counter("test").count());
+
+    r.remove(r1);
+    c.increment();
+    Assertions.assertEquals(2, r1.counter("test").count());
+    Assertions.assertEquals(2, r2.counter("test").count());
   }
 }

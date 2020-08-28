@@ -20,11 +20,13 @@ import com.netflix.spectator.api.Tag;
 import com.netflix.spectator.impl.PatternMatcher;
 import com.netflix.spectator.impl.Preconditions;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * Query for matching based on tags. For more information see:
@@ -83,21 +85,60 @@ public interface Query {
 
   /** Returns a new query: {@code this AND q}. */
   default Query and(Query q) {
-    return new And(this, q);
+    return (q == TRUE || q == FALSE) ? q.and(this) : new And(this, q);
   }
 
   /** Returns a new query: {@code this OR q}. */
   default Query or(Query q) {
-    return new Or(this, q);
+    return (q == TRUE || q == FALSE) ? q.or(this) : new Or(this, q);
   }
 
   /** Returns an inverted version of this query. */
   default Query not() {
-    return new Not(this);
+    return (this instanceof KeyQuery)
+        ? new InvertedKeyQuery((KeyQuery) this)
+        : new Not(this);
+  }
+
+  /**
+   * Converts this query into disjunctive normal form. The return value is a list of
+   * sub-queries that should be ORd together.
+   */
+  default List<Query> dnfList() {
+    return Collections.singletonList(this);
+  }
+
+  /**
+   * Converts this query into a list of sub-queries that can be ANDd together. The query will
+   * not be normalized first, it will only expand top-level AND clauses.
+   */
+  default List<Query> andList() {
+    return Collections.singletonList(this);
+  }
+
+  /**
+   * Return a new query that has been simplified by pre-evaluating the conditions for a set
+   * of tags that are common to all metrics.
+   */
+  default Query simplify(Map<String, String> tags) {
+    return this;
   }
 
   /** Query that always matches. */
   Query TRUE = new Query() {
+
+    @Override public Query and(Query q) {
+      return q;
+    }
+
+    @Override public Query or(Query q) {
+      return TRUE;
+    }
+
+    @Override public Query not() {
+      return FALSE;
+    }
+
     @Override public boolean matches(Map<String, String> tags) {
       return true;
     }
@@ -109,6 +150,19 @@ public interface Query {
 
   /** Query that never matches. */
   Query FALSE = new Query() {
+
+    @Override public Query and(Query q) {
+      return FALSE;
+    }
+
+    @Override public Query or(Query q) {
+      return q;
+    }
+
+    @Override public Query not() {
+      return TRUE;
+    }
+
     @Override public boolean matches(Map<String, String> tags) {
       return false;
     }
@@ -129,6 +183,32 @@ public interface Query {
       this.q2 = Preconditions.checkNotNull(q2, "q2");
     }
 
+    @Override public Query not() {
+      Query nq1 = q1.not();
+      Query nq2 = q2.not();
+      return nq1.or(nq2);
+    }
+
+    @Override public List<Query> dnfList() {
+      return crossAnd(q1.dnfList(), q2.dnfList());
+    }
+
+    @Override public List<Query> andList() {
+      List<Query> tmp = new ArrayList<>(q1.andList());
+      tmp.addAll(q2.andList());
+      return tmp;
+    }
+
+    private List<Query> crossAnd(List<Query> qs1, List<Query> qs2) {
+      List<Query> tmp = new ArrayList<>();
+      for (Query q1 : qs1) {
+        for (Query q2 : qs2) {
+          tmp.add(q1.and(q2));
+        }
+      }
+      return tmp;
+    }
+
     @Override public boolean matches(Map<String, String> tags) {
       return q1.matches(tags) && q2.matches(tags);
     }
@@ -140,13 +220,19 @@ public interface Query {
       return tags;
     }
 
+    @Override public Query simplify(Map<String, String> tags) {
+      Query sq1 = q1.simplify(tags);
+      Query sq2 = q2.simplify(tags);
+      return (sq1 != q1 || sq2 != q2) ? sq1.and(sq2) : this;
+    }
+
     @Override public String toString() {
       return q1 + "," + q2 + ",:and";
     }
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof And)) return false;
+      if (!(obj instanceof And)) return false;
       And other = (And) obj;
       return q1.equals(other.q1) && q2.equals(other.q2);
     }
@@ -169,8 +255,26 @@ public interface Query {
       this.q2 = Preconditions.checkNotNull(q2, "q2");
     }
 
+    @Override public Query not() {
+      Query nq1 = q1.not();
+      Query nq2 = q2.not();
+      return nq1.and(nq2);
+    }
+
+    @Override public List<Query> dnfList() {
+      List<Query> qs = new ArrayList<>(q1.dnfList());
+      qs.addAll(q2.dnfList());
+      return qs;
+    }
+
     @Override public boolean matches(Map<String, String> tags) {
       return q1.matches(tags) || q2.matches(tags);
+    }
+
+    @Override public Query simplify(Map<String, String> tags) {
+      Query sq1 = q1.simplify(tags);
+      Query sq2 = q2.simplify(tags);
+      return (sq1 != q1 || sq2 != q2) ? sq1.or(sq2) : this;
     }
 
     @Override public String toString() {
@@ -179,7 +283,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof Or)) return false;
+      if (!(obj instanceof Or)) return false;
       Or other = (Or) obj;
       return q1.equals(other.q1) && q2.equals(other.q2);
     }
@@ -200,8 +304,33 @@ public interface Query {
       this.q = Preconditions.checkNotNull(q, "q");
     }
 
+    @Override public Query not() {
+      return q;
+    }
+
+    @Override public List<Query> dnfList() {
+      if (q instanceof And) {
+        And query = (And) q;
+        List<Query> qs = new ArrayList<>(query.q1.not().dnfList());
+        qs.addAll(query.q2.not().dnfList());
+        return qs;
+      } else if (q instanceof Or) {
+        Or query = (Or) q;
+        Query q1 = query.q1.not();
+        Query q2 = query.q2.not();
+        return q1.and(q2).dnfList();
+      } else {
+        return Collections.singletonList(this);
+      }
+    }
+
     @Override public boolean matches(Map<String, String> tags) {
       return !q.matches(tags);
+    }
+
+    @Override public Query simplify(Map<String, String> tags) {
+      Query sq = q.simplify(tags);
+      return (sq != q) ? sq.not() : this;
     }
 
     @Override public String toString() {
@@ -210,7 +339,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof Not)) return false;
+      if (!(obj instanceof Not)) return false;
       Not other = (Not) obj;
       return q.equals(other.q);
     }
@@ -220,13 +349,148 @@ public interface Query {
     }
   }
 
+  /** Base interface for simple queries that check the value associated with a single key. */
+  interface KeyQuery extends Query {
+    /** Key checked by this query. */
+    String key();
+
+    /** Returns true if the value matches for this query clause. */
+    boolean matches(String value);
+
+    @Override default boolean matches(Map<String, String> tags) {
+      return matches(tags.get(key()));
+    }
+
+    @Override default Query simplify(Map<String, String> tags) {
+      String v = tags.get(key());
+      if (v == null) {
+        return this;
+      }
+      return matches(v) ? Query.TRUE : Query.FALSE;
+    }
+  }
+
+  /** Checks all of a set of conditions for the same key match the specified value. */
+  final class CompositeKeyQuery implements KeyQuery {
+    private final String k;
+    private final List<KeyQuery> queries;
+
+    /** Create a new instance. */
+    CompositeKeyQuery(KeyQuery query) {
+      Preconditions.checkNotNull(query, "query");
+      this.k = query.key();
+      this.queries = new ArrayList<>();
+      this.queries.add(query);
+    }
+
+    /** Add another query to the list. */
+    void add(KeyQuery query) {
+      Preconditions.checkArg(k.equals(query.key()), "key mismatch: " + k + " != " + query.key());
+      queries.add(query);
+    }
+
+    @Override public String key() {
+      return k;
+    }
+
+    @Override public boolean matches(String value) {
+      for (KeyQuery kq : queries) {
+        if (!kq.matches(value)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    @Override public String toString() {
+      StringBuilder builder = new StringBuilder();
+      boolean first = true;
+      for (KeyQuery kq : queries) {
+        if (first) {
+          first = false;
+          builder.append(kq);
+        } else {
+          builder.append(',').append(kq).append(",:and");
+        }
+      }
+      return builder.toString();
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      CompositeKeyQuery that = (CompositeKeyQuery) o;
+      return Objects.equals(queries, that.queries) && Objects.equals(k, that.k);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(queries, k);
+    }
+  }
+
+  /** Query that matches if the underlying key query does not match. */
+  final class InvertedKeyQuery implements KeyQuery {
+    private final KeyQuery q;
+
+    /** Create a new instance. */
+    InvertedKeyQuery(KeyQuery q) {
+      this.q = Preconditions.checkNotNull(q, "q");
+    }
+
+    @Override public Query not() {
+      return q;
+    }
+
+    @Override public String key() {
+      return q.key();
+    }
+
+    @Override public boolean matches(String value) {
+      return !q.matches(value);
+    }
+
+    @Override public Query simplify(Map<String, String> tags) {
+      Query sq = q.simplify(tags);
+      return (sq != q) ? sq.not() : this;
+    }
+
+    @Override public String toString() {
+      return q + ",:not";
+    }
+
+    @Override public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (!(obj instanceof InvertedKeyQuery)) return false;
+      InvertedKeyQuery other = (InvertedKeyQuery) obj;
+      return q.equals(other.q);
+    }
+
+    @Override public int hashCode() {
+      return q.hashCode();
+    }
+  }
+
   /** Query that matches if the tag map contains a specified key. */
-  final class Has implements Query {
+  final class Has implements KeyQuery {
     private final String k;
 
     /** Create a new instance. */
     Has(String k) {
       this.k = Preconditions.checkNotNull(k, "k");
+    }
+
+    @Override public String key() {
+      return k;
+    }
+
+    @Override public boolean matches(String value) {
+      return value != null;
     }
 
     @Override public boolean matches(Map<String, String> tags) {
@@ -239,7 +503,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof Has)) return false;
+      if (!(obj instanceof Has)) return false;
       Has other = (Has) obj;
       return k.equals(other.k);
     }
@@ -250,7 +514,7 @@ public interface Query {
   }
 
   /** Query that matches if the tag map contains key {@code k} with value {@code v}. */
-  final class Equal implements Query {
+  final class Equal implements KeyQuery {
     private final String k;
     private final String v;
 
@@ -260,8 +524,16 @@ public interface Query {
       this.v = Preconditions.checkNotNull(v, "v");
     }
 
-    @Override public boolean matches(Map<String, String> tags) {
-      return v.equals(tags.get(k));
+    @Override public String key() {
+      return k;
+    }
+
+    public String value() {
+      return v;
+    }
+
+    @Override public boolean matches(String value) {
+      return v.equals(value);
     }
 
     @Override public Map<String, String> exactTags() {
@@ -276,7 +548,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof Equal)) return false;
+      if (!(obj instanceof Equal)) return false;
       Equal other = (Equal) obj;
       return k.equals(other.k) && v.equals(other.v);
     }
@@ -292,7 +564,7 @@ public interface Query {
    * Query that matches if the tag map contains key {@code k} with a value in the set
    * {@code vs}.
    */
-  final class In implements Query {
+  final class In implements KeyQuery {
     private final String k;
     private final Set<String> vs;
 
@@ -303,19 +575,26 @@ public interface Query {
       this.vs = Preconditions.checkNotNull(vs, "vs");
     }
 
-    @Override public boolean matches(Map<String, String> tags) {
-      String s = tags.get(k);
-      return s != null && vs.contains(tags.get(k));
+    @Override public String key() {
+      return k;
+    }
+
+    public Set<String> values() {
+      return vs;
+    }
+
+    @Override public boolean matches(String value) {
+      return value != null && vs.contains(value);
     }
 
     @Override public String toString() {
-      String values = vs.stream().collect(Collectors.joining(","));
+      String values = String.join(",", vs);
       return k + ",(," + values + ",),:in";
     }
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof In)) return false;
+      if (!(obj instanceof In)) return false;
       In other = (In) obj;
       return k.equals(other.k) && vs.equals(other.vs);
     }
@@ -331,7 +610,7 @@ public interface Query {
    * Query that matches if the tag map contains key {@code k} with a value that is lexically
    * less than {@code v}.
    */
-  final class LessThan implements Query {
+  final class LessThan implements KeyQuery {
     private final String k;
     private final String v;
 
@@ -341,9 +620,12 @@ public interface Query {
       this.v = Preconditions.checkNotNull(v, "v");
     }
 
-    @Override public boolean matches(Map<String, String> tags) {
-      String s = tags.get(k);
-      return s != null && s.compareTo(v) < 0;
+    @Override public String key() {
+      return k;
+    }
+
+    @Override public boolean matches(String value) {
+      return value != null && value.compareTo(v) < 0;
     }
 
     @Override public String toString() {
@@ -352,7 +634,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof LessThan)) return false;
+      if (!(obj instanceof LessThan)) return false;
       LessThan other = (LessThan) obj;
       return k.equals(other.k) && v.equals(other.v);
     }
@@ -368,7 +650,7 @@ public interface Query {
    * Query that matches if the tag map contains key {@code k} with a value that is lexically
    * less than or equal to {@code v}.
    */
-  final class LessThanEqual implements Query {
+  final class LessThanEqual implements KeyQuery {
     private final String k;
     private final String v;
 
@@ -378,9 +660,12 @@ public interface Query {
       this.v = Preconditions.checkNotNull(v, "v");
     }
 
-    @Override public boolean matches(Map<String, String> tags) {
-      String s = tags.get(k);
-      return s != null && s.compareTo(v) <= 0;
+    @Override public String key() {
+      return k;
+    }
+
+    @Override public boolean matches(String value) {
+      return value != null && value.compareTo(v) <= 0;
     }
 
     @Override public String toString() {
@@ -389,7 +674,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof LessThanEqual)) return false;
+      if (!(obj instanceof LessThanEqual)) return false;
       LessThanEqual other = (LessThanEqual) obj;
       return k.equals(other.k) && v.equals(other.v);
     }
@@ -405,7 +690,7 @@ public interface Query {
    * Query that matches if the tag map contains key {@code k} with a value that is lexically
    * greater than {@code v}.
    */
-  final class GreaterThan implements Query {
+  final class GreaterThan implements KeyQuery {
     private final String k;
     private final String v;
 
@@ -415,9 +700,12 @@ public interface Query {
       this.v = Preconditions.checkNotNull(v, "v");
     }
 
-    @Override public boolean matches(Map<String, String> tags) {
-      String s = tags.get(k);
-      return s != null && s.compareTo(v) > 0;
+    @Override public String key() {
+      return k;
+    }
+
+    @Override public boolean matches(String value) {
+      return value != null && value.compareTo(v) > 0;
     }
 
     @Override public String toString() {
@@ -426,7 +714,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof GreaterThan)) return false;
+      if (!(obj instanceof GreaterThan)) return false;
       GreaterThan other = (GreaterThan) obj;
       return k.equals(other.k) && v.equals(other.v);
     }
@@ -442,7 +730,7 @@ public interface Query {
    * Query that matches if the tag map contains key {@code k} with a value that is lexically
    * greater than or equal to {@code v}.
    */
-  final class GreaterThanEqual implements Query {
+  final class GreaterThanEqual implements KeyQuery {
     private final String k;
     private final String v;
 
@@ -452,9 +740,12 @@ public interface Query {
       this.v = Preconditions.checkNotNull(v, "v");
     }
 
-    @Override public boolean matches(Map<String, String> tags) {
-      String s = tags.get(k);
-      return s != null && s.compareTo(v) >= 0;
+    @Override public String key() {
+      return k;
+    }
+
+    @Override public boolean matches(String value) {
+      return value != null && value.compareTo(v) >= 0;
     }
 
     @Override public String toString() {
@@ -463,7 +754,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof GreaterThanEqual)) return false;
+      if (!(obj instanceof GreaterThanEqual)) return false;
       GreaterThanEqual other = (GreaterThanEqual) obj;
       return k.equals(other.k) && v.equals(other.v);
     }
@@ -483,7 +774,7 @@ public interface Query {
    * <p><b>Warning:</b> regular expressions are often expensive and can add a lot of overhead.
    * Use them sparingly.</p>
    */
-  final class Regex implements Query {
+  final class Regex implements KeyQuery {
     private final String k;
     private final String v;
     private final PatternMatcher pattern;
@@ -506,9 +797,12 @@ public interface Query {
       this.name = Preconditions.checkNotNull(name, "name");
     }
 
-    @Override public boolean matches(Map<String, String> tags) {
-      String s = tags.get(k);
-      return s != null && pattern.matches(s);
+    @Override public String key() {
+      return k;
+    }
+
+    @Override public boolean matches(String value) {
+      return value != null && pattern.matches(value);
     }
 
     @Override public String toString() {
@@ -517,7 +811,7 @@ public interface Query {
 
     @Override public boolean equals(Object obj) {
       if (this == obj) return true;
-      if (obj == null || !(obj instanceof Regex)) return false;
+      if (!(obj instanceof Regex)) return false;
       Regex other = (Regex) obj;
       return k.equals(other.k)
           && v.equals(other.v)

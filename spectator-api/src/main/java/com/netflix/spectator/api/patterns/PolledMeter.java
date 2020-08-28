@@ -33,7 +33,10 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.DoubleSupplier;
+import java.util.function.LongSupplier;
 import java.util.function.ToDoubleFunction;
 import java.util.function.ToLongFunction;
 
@@ -124,7 +127,7 @@ public final class PolledMeter {
   public static void remove(Registry registry, Id id) {
     Object obj = registry.state().get(id);
     if (obj instanceof AbstractMeterState) {
-      registry.state().remove(id, obj);
+      ((AbstractMeterState) obj).cleanup(registry);
     }
   }
 
@@ -201,8 +204,11 @@ public final class PolledMeter {
      *
      * <p>A weak reference will be kept to {@code obj} so that monitoring the object will
      * not prevent garbage collection. The meter will go away when {@code obj} is collected.
-     * To explicitly disable polling call {@link #remove(Registry, Id)} with the same id used with
-     * this builder.</p>
+     * If {@code obj} is null, then it will be treated as an already collected object and a
+     * warning will be logged.</p>
+     *
+     * <p>To explicitly disable polling call {@link #remove(Registry, Id)} with the same id used
+     * with this builder.</p>
      *
      * @param obj
      *     Object used to compute a value.
@@ -215,6 +221,12 @@ public final class PolledMeter {
     @SuppressWarnings("unchecked")
     public <T> T monitorValue(T obj, ToDoubleFunction<T> f) {
       final Id id = baseId.withTags(extraTags);
+      if (obj == null) {
+        registry.propagate(new IllegalArgumentException(
+            "obj is null for PolledMeter (id = " + id + "), no data will be reported. "
+                + "See the API docs for monitorValue for guidance on how to fix the code."));
+        return null;
+      }
       final Gauge gauge = registry.gauge(id);
       final ValueState<T> tuple = new ValueState<>(gauge);
 
@@ -229,6 +241,27 @@ public final class PolledMeter {
       }
 
       return obj;
+    }
+
+    /**
+     * Poll by executing {@code supplier.getAsDouble()} and reporting the returned value. The
+     * provided function must be thread safe and cheap to execute. Expensive operations, including
+     * any IO or network calls, should not be performed inline unless using a custom executor by
+     * calling {@link #scheduleOn(ScheduledExecutorService)}. Assume that the function will be
+     * called frequently and may be called concurrently.
+     *
+     * <p>This helper should only be used with static method references. It will keep a strong
+     * reference to any enclosed objects and they will never get garbage collected unless removed
+     * explicitly by the user.</p>
+     *
+     * <p>To explicitly disable polling call {@link #remove(Registry, Id)} with the same id used
+     * with this builder.</p>
+     *
+     * @param supplier
+     *     Supplier that will be called to access the value.
+     */
+    public void monitorStaticMethodValue(DoubleSupplier supplier) {
+      monitorValue(supplier, DoubleSupplier::getAsDouble);
     }
 
     /**
@@ -281,8 +314,11 @@ public final class PolledMeter {
      *
      * <p>A weak reference will be kept to {@code obj} so that monitoring the object will
      * not prevent garbage collection. The meter will go away when {@code obj} is collected.
-     * To explicitly disable polling call {@link #remove(Registry, Id)} with the same id used with
-     * this builder.</p>
+     * If {@code obj} is null, then it will be treated as an already collected object and a
+     * warning will be logged.</p>
+     *
+     * <p>To explicitly disable polling call {@link #remove(Registry, Id)} with the same id used
+     * with this builder.</p>
      *
      * @param obj
      *     Object used to compute a value.
@@ -295,6 +331,13 @@ public final class PolledMeter {
     @SuppressWarnings("unchecked")
     public <T> T monitorMonotonicCounter(T obj, ToLongFunction<T> f) {
       final Id id = baseId.withTags(extraTags);
+      if (obj == null) {
+        registry.propagate(new IllegalArgumentException(
+            "obj is null for PolledMeter (id = " + id + "), no data will be reported. "
+                + "See the API docs for monitorMonotonicCounter for guidance on how to "
+                + "fix the code."));
+        return null;
+      }
       final Counter counter = registry.counter(id);
       final CounterState<T> tuple = new CounterState<>(counter);
 
@@ -309,6 +352,32 @@ public final class PolledMeter {
       }
 
       return obj;
+    }
+
+    /**
+     * Map a monotonically increasing long or int value to a counter. Monotonic counters
+     * are frequently used as a simple way for exposing the amount of change. In order to be
+     * useful, they need to be polled frequently so the change can be measured regularly over
+     * time.
+     *
+     * <p>Poll by executing {@code supplier.getAsLong()} and reporting the returned value. The
+     * provided function must be thread safe and cheap to execute. Expensive operations, including
+     * any IO or network calls, should not be performed inline unless using a custom executor by
+     * calling {@link #scheduleOn(ScheduledExecutorService)}. Assume that the function will be
+     * called frequently and may be called concurrently.</p>
+     *
+     * <p>This helper should only be used with static method references. It will keep a strong
+     * reference to any enclosed objects and they will never get garbage collected unless removed
+     * explicitly by the user.</p>
+     *
+     * <p>To explicitly disable polling call {@link #remove(Registry, Id)} with the same id used
+     * with this builder.</p>
+     *
+     * @param supplier
+     *     Supplier that will be called to access the value.
+     */
+    public void monitorStaticMethodMonotonicCounter(LongSupplier supplier) {
+      monitorMonotonicCounter(supplier, LongSupplier::getAsLong);
     }
 
     /**
@@ -365,7 +434,7 @@ public final class PolledMeter {
 
   /** Base class for meter state used for bookkeeping. */
   abstract static class AbstractMeterState {
-    private boolean scheduled = false;
+    private Future<?> future = null;
 
     /** Return the id for the meter. */
     protected abstract Id id();
@@ -376,6 +445,14 @@ public final class PolledMeter {
     /** Sample the meter and send updates to the registry. */
     protected abstract void update(Registry registry);
 
+    /** Cleanup any state associated with this meter and stop polling. */
+    void cleanup(Registry registry) {
+      if (future != null) {
+        future.cancel(true);
+      }
+      registry.state().remove(id());
+    }
+
     /**
      * Update the registry if this meter is not expired, otherwise cleanup any state
      * associated with this meter.
@@ -383,7 +460,7 @@ public final class PolledMeter {
     @SuppressWarnings("PMD.AvoidCatchingThrowable")
     void doUpdate(Registry registry) {
       if (hasExpired()) {
-        registry.state().remove(id());
+        cleanup(registry);
       } else {
         try {
           update(registry);
@@ -396,14 +473,13 @@ public final class PolledMeter {
 
     /** Schedule a task to regularly update the registry. */
     void schedule(Registry registry, ScheduledExecutorService executor, long delay) {
-      if (!scheduled) {
+      if (future == null) {
         WeakReference<AbstractMeterState> tupleRef = new WeakReference<>(this);
         if (executor == null) {
-          GaugePoller.schedule(tupleRef, delay, t -> t.doUpdate(registry));
+          future = GaugePoller.schedule(tupleRef, delay, t -> t.doUpdate(registry));
         } else {
-          GaugePoller.schedule(executor, tupleRef, delay, t -> t.doUpdate(registry));
+          future = GaugePoller.schedule(executor, tupleRef, delay, t -> t.doUpdate(registry));
         }
-        scheduled = true;
       }
     }
   }
@@ -465,7 +541,7 @@ public final class PolledMeter {
 
     /** Create new instance. */
     ValueEntry(T obj, ToDoubleFunction<T> f) {
-      this.ref = new WeakReference<T>(obj);
+      this.ref = new WeakReference<>(obj);
       this.f = f;
     }
   }
@@ -576,7 +652,7 @@ public final class PolledMeter {
 
     /** Create new instance. */
     CounterEntry(T obj, ToLongFunction<T> f) {
-      this.ref = new WeakReference<T>(obj);
+      this.ref = new WeakReference<>(obj);
       this.f = f;
       this.previous = f.applyAsLong(obj);
     }

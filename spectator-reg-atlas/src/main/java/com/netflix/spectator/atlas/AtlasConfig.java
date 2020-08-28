@@ -15,6 +15,8 @@
  */
 package com.netflix.spectator.atlas;
 
+import com.netflix.spectator.api.Clock;
+import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.RegistryConfig;
 
 import java.time.Duration;
@@ -48,16 +50,27 @@ public interface AtlasConfig extends RegistryConfig {
    */
   default boolean enabled() {
     String v = get("atlas.enabled");
-    return v == null || Boolean.valueOf(v);
+    return v == null || Boolean.parseBoolean(v);
+  }
+
+  /**
+   * Returns true if the registry should automatically start the background reporting threads
+   * in the constructor. When using DI systems this can be used to automatically start the
+   * registry when it is constructed. Otherwise the {@code AtlasRegistry.start()} method will
+   * need to be called explicitly. Default is false.
+   */
+  default boolean autoStart() {
+    String v = get("atlas.autoStart");
+    return v != null && Boolean.parseBoolean(v);
   }
 
   /**
    * Returns the number of threads to use with the scheduler. The default is
-   * 2 threads.
+   * 4 threads.
    */
   default int numThreads() {
     String v = get("atlas.numThreads");
-    return (v == null) ? 2 : Integer.parseInt(v);
+    return (v == null) ? 4 : Integer.parseInt(v);
   }
 
   /**
@@ -70,11 +83,32 @@ public interface AtlasConfig extends RegistryConfig {
   }
 
   /**
+   * Returns the step size (reporting frequency) to use for streaming to Atlas LWC.
+   * The default is 5s. This is the highest resolution that would be supported for getting
+   * an on-demand stream of the data. It must be less than or equal to the Atlas step
+   * ({@link #step()}) and the Atlas step should be an even multiple of this value.
+   */
+  default Duration lwcStep() {
+    String v = get("atlas.lwc.step");
+    return (v == null) ? Duration.ofSeconds(5) : Duration.parse(v);
+  }
+
+  /**
    * Returns true if streaming to Atlas LWC is enabled. Default is false.
    */
   default boolean lwcEnabled() {
     String v = get("atlas.lwc.enabled");
-    return v != null && Boolean.valueOf(v);
+    return v != null && Boolean.parseBoolean(v);
+  }
+
+  /**
+   * Returns true if expressions with the same step size as Atlas publishing should be
+   * ignored for streaming. This is used for cases where data being published to Atlas
+   * is also sent into streaming from the backend. Default is true.
+   */
+  default boolean lwcIgnorePublishStep() {
+    String v = get("atlas.lwc.ignore-publish-step");
+    return v == null || Boolean.parseBoolean(v);
   }
 
   /** Returns the frequency for refreshing config settings from the LWC service. */
@@ -143,9 +177,8 @@ public interface AtlasConfig extends RegistryConfig {
   }
 
   /**
-   * Returns a pattern indicating the valid characters for a tag key or value. The character
-   * set for tag values can be overridden for a particular tag key using
-   * {@link #validTagValueCharacters()}. The default is {@code -._A-Za-z0-9~^}.
+   * Returns a pattern indicating the valid characters for a tag key or value. The default is
+   * {@code -._A-Za-z0-9~^}.
    */
   default String validTagCharacters() {
     return "-._A-Za-z0-9~^";
@@ -154,8 +187,63 @@ public interface AtlasConfig extends RegistryConfig {
   /**
    * Returns a map from tag key to a pattern indicating the valid characters for the values
    * of that key. The default is an empty map.
+   *
+   * @deprecated This method is no longer used internally.
    */
+  @Deprecated
   default Map<String, String> validTagValueCharacters() {
     return Collections.emptyMap();
+  }
+
+  /**
+   * Returns a registry to use for recording metrics about the behavior of the AtlasRegistry.
+   * By default it will return null and the metrics will be reported to itself. In some cases
+   * it is useful to customize this for debugging so that the metrics for the behavior of
+   * AtlasRegistry will have a different failure mode than AtlasRegistry.
+   */
+  default Registry debugRegistry() {
+    return null;
+  }
+
+  /**
+   * Returns a rollup policy that will be applied to the measurements before sending to Atlas.
+   * The policy will not be applied to data going to the streaming path. Default is a no-op
+   * policy.
+   */
+  default RollupPolicy rollupPolicy() {
+    return RollupPolicy.noop(commonTags());
+  }
+
+  /**
+   * Avoid collecting right on boundaries to minimize transitions on step longs
+   * during a collection. By default it will randomly distribute across the middle
+   * of the step interval.
+   */
+  default long initialPollingDelay(Clock clock, long stepSize) {
+    long now = clock.wallTime();
+    long stepBoundary = now / stepSize * stepSize;
+
+    // Buffer by 10% of the step interval on either side
+    long offset = stepSize / 10;
+
+    // For larger intervals spread it out, otherwise bias towards the start
+    // to ensure there is plenty of time to send without needing to cross over
+    // to the next interval. The threshold of 1s was chosen because it is typically
+    // big enough to avoid GC troubles where it is common to see pause times in the
+    // low 100s of milliseconds.
+    if (offset >= 1000L) {
+      // Check if the current delay is within the acceptable range
+      long delay = now - stepBoundary;
+      if (delay < offset) {
+        return delay + offset;
+      } else {
+        return Math.min(delay, stepSize - offset);
+      }
+    } else {
+      long firstTime = stepBoundary + stepSize / 10;
+      return firstTime > now
+          ? firstTime - now
+          : firstTime + stepSize - now;
+    }
   }
 }

@@ -165,6 +165,13 @@ public enum IpcTagKey {
   serverPort("ipc.server.port"),
 
   /**
+   * Indicates that an artificial failure was injected into the request processing for testing
+   * purposes. The outcome of that failure will be reflected in the other error tags.
+   * See {@link IpcFailureInjection} for permitted values.
+   */
+  failureInjected("ipc.failure.injected"),
+
+  /**
    * HTTP status code. In most cases it is preferred to use {@link #statusDetail} instead.
    * This tag key is optionally used to include the HTTP status code when the status detail
    * is overridden with application specific values.

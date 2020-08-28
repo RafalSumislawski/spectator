@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,17 @@
  */
 package com.netflix.spectator.api;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.function.BiPredicate;
+import java.util.function.Predicate;
 
 /**
  * Identifier for a meter or measurement.
  */
-public interface Id {
+public interface Id extends TagList {
+
   /** Description of the measurement that is being collected. */
   String name();
 
@@ -73,9 +78,12 @@ public interface Id {
    */
   @SuppressWarnings("PMD.UseObjectForClearerAPI")
   default Id withTags(String k1, String v1, String k2, String v2) {
-    final Tag[] ts = new Tag[] {
-        new BasicTag(k1, v1),
-        new BasicTag(k2, v2)
+    // The original reason for this method was to avoid allocating a string array before
+    // creating a Tag array. The internals have changed so it can work on the string array
+    // directly. The overload is kept for backwards compatiblity.
+    final String[] ts = {
+        k1, v1,
+        k2, v2
     };
     return withTags(ts);
   }
@@ -86,10 +94,13 @@ public interface Id {
    */
   @SuppressWarnings("PMD.UseObjectForClearerAPI")
   default Id withTags(String k1, String v1, String k2, String v2, String k3, String v3) {
-    final Tag[] ts = new Tag[] {
-        new BasicTag(k1, v1),
-        new BasicTag(k2, v2),
-        new BasicTag(k3, v3)
+    // The original reason for this method was to avoid allocating a string array before
+    // creating a Tag array. The internals have changed so it can work on the string array
+    // directly. The overload is kept for backwards compatiblity.
+    final String[] ts = {
+        k1, v1,
+        k2, v2,
+        k3, v3
     };
     return withTags(ts);
   }
@@ -121,13 +132,51 @@ public interface Id {
     return tmp;
   }
 
-  /** Return a new id with additional tag values. */
+  /**
+   * Return a new id with additional tag values.
+   *
+   * If using a {@link java.util.concurrent.ConcurrentMap}, note that the map <strong>should
+   * not</strong> be concurrently modified during this call. It is up to the user to ensure
+   * that it contains the correct set of tags that should be added to the id before and for the
+   * entire duration of the call until the new id is returned.
+   */
   default Id withTags(Map<String, String> tags) {
     Id tmp = this;
     for (Map.Entry<String, String> entry : tags.entrySet()) {
       tmp = tmp.withTag(entry.getKey(), entry.getValue());
     }
     return tmp;
+  }
+
+  /** Return the key at the specified index. The name will be treated as position 0. */
+  @Override default String getKey(int i) {
+    return i == 0 ? "name" : Utils.getValue(tags(), i - 1).key();
+  }
+
+  /** Return the value at the specified index. The name will be treated as position 0. */
+  @Override default String getValue(int i) {
+    return i == 0 ? name() : Utils.getValue(tags(), i - 1).value();
+  }
+
+  /** Return the size, number of tags, for the id including the name. */
+  @Override default int size() {
+    return Utils.size(tags()) + 1;
+  }
+
+  /** Return a new tag list with only tags that match the predicate. */
+  @Override default Id filter(BiPredicate<String, String> predicate) {
+    List<Tag> filtered = new ArrayList<>();
+    for (Tag tag : tags()) {
+      if (predicate.test(tag.key(), tag.value())) {
+        filtered.add(tag);
+      }
+    }
+    return new DefaultId(name(), ArrayTagSet.create(filtered));
+  }
+
+  /** Return a new tag list with only tags with keys that match the predicate. */
+  @Override default Id filterByKey(Predicate<String> predicate) {
+    return filter((k, v) -> predicate.test(k));
   }
 
   /**

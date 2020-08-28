@@ -26,10 +26,11 @@ import org.junit.jupiter.api.Test;
 
 public class AtlasMaxGaugeTest {
 
-  private ManualClock clock = new ManualClock();
-  private Registry registry = new DefaultRegistry();
-  private long step = 10000L;
-  private AtlasMaxGauge gauge = new AtlasMaxGauge(registry.createId("test"), clock, step, step);
+  private final ManualClock clock = new ManualClock();
+  private final Registry registry = new DefaultRegistry();
+  private final long step = 10000L;
+  private final AtlasMaxGauge gauge = new AtlasMaxGauge(registry,
+      registry.createId("test"), clock, step, step);
 
   private void checkValue(long expected) {
     int count = 0;
@@ -53,6 +54,33 @@ public class AtlasMaxGaugeTest {
 
     clock.setWallTime(step + 1);
     checkValue(42);
+  }
+
+  @Test
+  public void setNaN() {
+    gauge.set(Double.NaN);
+    checkValue(0);
+
+    clock.setWallTime(step + 1);
+    checkValue(0);
+  }
+
+  @Test
+  public void setInfinity() {
+    gauge.set(Double.POSITIVE_INFINITY);
+    checkValue(0);
+
+    clock.setWallTime(step + 1);
+    checkValue(0);
+  }
+
+  @Test
+  public void setNegative() {
+    gauge.set(-1);
+    checkValue(0);
+
+    clock.setWallTime(step + 1);
+    checkValue(0);
   }
 
   @Test

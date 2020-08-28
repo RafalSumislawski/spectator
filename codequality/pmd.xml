@@ -17,7 +17,6 @@
     <exclude name="AvoidCatchingGenericException"/>
     <exclude name="AvoidDuplicateLiterals"/>
     <exclude name="AvoidFieldNameMatchingMethodName"/>
-    <exclude name="AvoidFinalLocalVariable"/>
     <exclude name="AvoidInstantiatingObjectsInLoops"/>
     <exclude name="AvoidLiteralsInIfCondition"/>
     <exclude name="AvoidSynchronizedAtMethodLevel"/>
@@ -27,6 +26,7 @@
     <exclude name="AvoidUsingVolatile"/>
     <exclude name="BeanMembersShouldSerialize"/>
     <exclude name="ClassNamingConventions"/>
+    <exclude name="CloseResource"/>
     <exclude name="CommentDefaultAccessModifier"/>
     <exclude name="CommentRequired"/>
     <exclude name="CommentSize"/>
@@ -49,7 +49,6 @@
     <exclude name="ImmutableField"/>
     <exclude name="LawOfDemeter"/>
     <exclude name="LocalVariableCouldBeFinal"/>
-    <exclude name="LoggerIsNotStaticFinal"/>
     <exclude name="LongVariable"/>
     <exclude name="LoosePackageCoupling"/>
     <exclude name="MethodArgumentCouldBeFinal"/>
@@ -75,6 +74,7 @@
     <exclude name="UseIndexOfChar"/>
     <exclude name="UselessParentheses"/>
     <exclude name="UseStringBufferForStringAppends"/>
+    <exclude name="UseUnderscoresInNumericLiterals"/>
     <exclude name="UseVarargs"/>
   </rule>
 </ruleset>

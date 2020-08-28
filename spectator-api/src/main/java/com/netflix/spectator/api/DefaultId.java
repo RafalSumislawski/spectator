@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.BiPredicate;
 
 /** Id implementation for the default registry. */
 final class DefaultId implements Id {
@@ -69,6 +70,22 @@ final class DefaultId implements Id {
 
   @Override public DefaultId withTags(Map<String, String> ts) {
     return new DefaultId(name, tags.addAll(ts));
+  }
+
+  @Override public String getKey(int i) {
+    return i == 0 ? "name" : tags.getKey(i - 1);
+  }
+
+  @Override public String getValue(int i) {
+    return i == 0 ? name : tags.getValue(i - 1);
+  }
+
+  @Override public int size() {
+    return tags.size() + 1;
+  }
+
+  @Override public Id filter(BiPredicate<String, String> predicate) {
+    return new DefaultId(name, tags.filter(predicate));
   }
 
   /**

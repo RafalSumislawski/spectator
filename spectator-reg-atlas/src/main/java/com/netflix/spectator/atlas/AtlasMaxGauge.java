@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,9 @@ package com.netflix.spectator.atlas;
 import com.netflix.spectator.api.Clock;
 import com.netflix.spectator.api.Gauge;
 import com.netflix.spectator.api.Id;
-import com.netflix.spectator.api.Measurement;
+import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.Statistic;
 import com.netflix.spectator.impl.StepDouble;
-
-import java.util.Collections;
 
 /**
  * Gauge that reports the maximum value submitted during an interval to Atlas. Main use-case
@@ -35,21 +33,23 @@ class AtlasMaxGauge extends AtlasMeter implements Gauge {
   private final Id stat;
 
   /** Create a new instance. */
-  AtlasMaxGauge(Id id, Clock clock, long ttl, long step) {
+  AtlasMaxGauge(Registry registry, Id id, Clock clock, long ttl, long step) {
     super(id, clock, ttl);
     this.value = new StepDouble(0.0, clock, step);
     // Add the statistic for typing. Re-adding the tags from the id is to retain
     // the statistic from the id if it was already set
-    this.stat = id.withTag(Statistic.max).withTags(id.tags()).withTag(DsType.gauge);
+    this.stat = registry.createId(id.name())
+        .withTag(Statistic.max)
+        .withTag(DsType.gauge)
+        .withTags(id.tags());
   }
 
-  @Override public Iterable<Measurement> measure() {
+  @Override void measure(MeasurementConsumer consumer) {
     // poll needs to be called before accessing the timestamp to ensure
     // the counters have been rotated if there was no activity in the
     // current interval.
     double v = value.poll();
-    final Measurement m = new Measurement(stat, value.timestamp(), v);
-    return Collections.singletonList(m);
+    consumer.accept(stat, value.timestamp(), v);
   }
 
   @Override public void set(double v) {

@@ -37,7 +37,7 @@ public class TestMeter implements Meter {
   }
 
   public TestMeter(String name, List<Measurement> measures) {
-    myId = new TestId(name);
+    myId = Id.create(name);
     myMeasurements = measures;
   }
   public Id id() { return myId; }
@@ -47,5 +47,5 @@ public class TestMeter implements Meter {
   public boolean hasExpired() {
       return false;
   }
-};
+}
 

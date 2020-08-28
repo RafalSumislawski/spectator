@@ -1,20 +1,15 @@
 buildscript {
   repositories { jcenter() }
   dependencies {
-    classpath 'com.github.ben-manes:gradle-versions-plugin:0.17.0'
-    classpath 'com.netflix.nebula:nebula-dependency-recommender:6.1.1'
-    classpath 'com.netflix.nebula:gradle-netflixoss-project-plugin:7.1.0'
-
-    // This is a workaround for getting the shadow plugin to work correctly
-    // for some sub-projects. For more details see:
-    // https://github.com/johnrengelman/shadow/issues/188
-    classpath 'org.apache.ant:ant:1.9.7'
+    classpath 'com.github.ben-manes:gradle-versions-plugin:0.29.0'
+    classpath 'com.netflix.nebula:nebula-dependency-recommender:9.0.2'
+    classpath 'com.netflix.nebula:gradle-netflixoss-project-plugin:8.8.1'
   }
 }
 
 plugins {
-  id 'me.champeau.gradle.jmh' version '0.4.7'
-  id "com.github.spotbugs" version "1.6.9" apply false
+  id 'me.champeau.gradle.jmh' version '0.5.0'
+  id "com.github.spotbugs" version "4.5.0" apply false
 }
 
 // Establish version and status
@@ -29,8 +24,7 @@ allprojects {
 }
 
 subprojects {
-  apply plugin: 'nebula.compile-api'
-  apply plugin: 'java'
+  apply plugin: 'java-library'
   apply plugin: 'build-dashboard'
   apply plugin: 'com.github.spotbugs'
   apply plugin: 'checkstyle'
@@ -65,12 +59,15 @@ subprojects {
       if (JavaVersion.current().isJava8Compatible()) {
         options.addStringOption('Xdoclint:none', '-quiet')
       }
+      if (JavaVersion.current().isJava9Compatible()) {
+        options.addStringOption('-release', '8')
+      }
     }
   }
 
   javadoc {
     options {
-      links = ['http://docs.oracle.com/javase/8/docs/api/']
+      links = ['https://docs.oracle.com/javase/8/docs/api/']
     }
   }
 
@@ -79,12 +76,12 @@ subprojects {
   }
 
   dependencies {
-    compile "org.slf4j:slf4j-api"
-    testCompile 'org.junit.jupiter:junit-jupiter-engine'
-    testCompile 'nl.jqno.equalsverifier:equalsverifier'
+    implementation "org.slf4j:slf4j-api"
+    testImplementation 'org.junit.jupiter:junit-jupiter-engine'
+    testImplementation 'nl.jqno.equalsverifier:equalsverifier'
     jmh "org.slf4j:slf4j-simple"
-    jmh "org.openjdk.jmh:jmh-core:1.19"
-    jmh "org.openjdk.jmh:jmh-generator-annprocess:1.19"
+    jmh "org.openjdk.jmh:jmh-core:1.25"
+    jmh "org.openjdk.jmh:jmh-generator-annprocess:1.25"
   }
 
   test {
@@ -92,31 +89,33 @@ subprojects {
   }
 
   jmh {
-    jmhVersion = '1.21'
-    warmupIterations = 5
-    iterations = 10
+    jmhVersion = '1.25'
+    warmupIterations = 2
+    iterations = 5
     fork = 1
-    threads = 1
+    //threads = 1
     profilers = ['stack', 'gc']
     includeTests = false
     duplicateClassesStrategy = 'warn'
-    include = ['.*PercentileTimers.*']
+    include = ['.*PollMetersBench.*']
   }
 
   checkstyle {
-    toolVersion = '8.14'
+    toolVersion = '8.32'
     ignoreFailures = false 
     configFile = rootProject.file('codequality/checkstyle.xml')
     sourceSets = [sourceSets.main]
   }
   
   spotbugs {
-    toolVersion = '3.1.10'
+    toolVersion = '4.0.6'
     excludeFilter = rootProject.file('codequality/findbugs-exclude.xml')
     ignoreFailures = false
-    sourceSets = [sourceSets.main]
+    spotbugsMain.enabled = true
+    spotbugsTest.enabled = false
+    spotbugsJmh.enabled = false
   }
-  tasks.withType(com.github.spotbugs.SpotBugsTask) {
+  spotbugsMain {
     reports {
       xml.enabled = false
       html.enabled = true
@@ -124,7 +123,7 @@ subprojects {
   }
 
   pmd {
-    toolVersion = '6.9.0'
+    toolVersion = '6.23.0'
     ignoreFailures = false
     sourceSets = [sourceSets.main]
     ruleSets = []

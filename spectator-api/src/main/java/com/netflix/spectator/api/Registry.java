@@ -467,7 +467,7 @@ public interface Registry extends Iterable<Meter> {
 
   /**
    * Tells the registry to regularly poll the value of a {@link java.lang.Number} and report
-   * it as a gauge. See {@link #gauge(Id, Number)} for more information.
+   * it as a gauge.
    *
    * @param id
    *     Identifier for the metric being registered.
@@ -753,6 +753,18 @@ public interface Registry extends Iterable<Meter> {
   @Deprecated
   default void methodValue(String name, Object obj, String method) {
     methodValue(createId(name), obj, method);
+  }
+
+  /**
+   * Returns a stream with the current flattened set of measurements across all meters.
+   * This should typically be preferred over {@link #stream()} to get the data as it will
+   * automatically handle expired meters, NaN values, etc.
+   */
+  default Stream<Measurement> measurements() {
+    return stream()
+        .filter(m -> !m.hasExpired())
+        .flatMap(m -> StreamSupport.stream(m.measure().spliterator(), false))
+        .filter(m -> !Double.isNaN(m.value()));
   }
 
   /** Returns a stream of all registered meters. */

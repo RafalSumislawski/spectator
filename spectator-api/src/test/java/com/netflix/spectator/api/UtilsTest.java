@@ -36,7 +36,7 @@ public class UtilsTest {
   public void getTagValueIdNoTags() {
     Registry r = new DefaultRegistry();
     Id id = r.createId("foo");
-    Assertions.assertEquals(null, Utils.getTagValue(id, "abc"));
+    Assertions.assertNull(Utils.getTagValue(id, "abc"));
   }
 
   @Test
@@ -45,6 +45,13 @@ public class UtilsTest {
     Id id = r.createId("foo", "bar", "baz", "abc", "def");
     Assertions.assertEquals("def", Utils.getTagValue(id, "abc"));
     Assertions.assertEquals("baz", Utils.getTagValue(id, "bar"));
+  }
+
+  @Test
+  public void getTagValueIterable() {
+    Registry r = new DefaultRegistry();
+    Id id = r.createId("foo", "bar", "baz", "abc", "def");
+    Assertions.assertEquals("def", Utils.getTagValue(id.tags()::iterator, "abc"));
   }
 
   @Test
@@ -75,7 +82,7 @@ public class UtilsTest {
   public void firstPredicateEmpty() {
     List<Measurement> ms = newList(10);
     Measurement m = Utils.first(ms, v -> false);
-    Assertions.assertEquals(null, m);
+    Assertions.assertNull(m);
   }
 
   @Test
@@ -110,5 +117,55 @@ public class UtilsTest {
     List<Measurement> ms = newList(10);
     List<Measurement> out = Utils.toList(Utils.filter(ms, v -> false));
     Assertions.assertEquals(0, out.size());
+  }
+
+  @Test
+  public void sizeTagList() {
+    Id id = Id.create("test").withTags("a", "1", "b", "2");
+    Assertions.assertEquals(2, Utils.size(id.tags()));
+  }
+
+  @Test
+  public void sizeCollection() {
+    List<String> vs = new ArrayList<>();
+    vs.add("a");
+    vs.add("b");
+    vs.add("c");
+    Assertions.assertEquals(3, Utils.size(vs));
+  }
+
+  @Test
+  public void sizeIterable() {
+    List<String> vs = new ArrayList<>();
+    vs.add("a");
+    vs.add("b");
+    Assertions.assertEquals(2, Utils.size(vs::iterator));
+  }
+
+  @Test
+  public void getValueList() {
+    List<String> vs = new ArrayList<>();
+    vs.add("a");
+    vs.add("b");
+    vs.add("c");
+    Assertions.assertEquals("a", Utils.getValue(vs, 0));
+    Assertions.assertEquals("b", Utils.getValue(vs, 1));
+    Assertions.assertEquals("c", Utils.getValue(vs, 2));
+    Assertions.assertThrows(IndexOutOfBoundsException.class, () -> Utils.getValue(vs, 3));
+    Assertions.assertThrows(IndexOutOfBoundsException.class, () -> Utils.getValue(vs, -3));
+  }
+
+  @Test
+  public void getValueIterable() {
+    List<String> vs = new ArrayList<>();
+    vs.add("a");
+    vs.add("b");
+    vs.add("c");
+    Iterable<String> it = vs::iterator;
+    Assertions.assertEquals("a", Utils.getValue(it, 0));
+    Assertions.assertEquals("b", Utils.getValue(it, 1));
+    Assertions.assertEquals("c", Utils.getValue(it, 2));
+    Assertions.assertThrows(IndexOutOfBoundsException.class, () -> Utils.getValue(it, 3));
+    Assertions.assertThrows(IndexOutOfBoundsException.class, () -> Utils.getValue(it, -3));
   }
 }

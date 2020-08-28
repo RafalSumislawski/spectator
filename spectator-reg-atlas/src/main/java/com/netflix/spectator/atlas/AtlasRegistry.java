@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,38 +26,52 @@ import com.netflix.spectator.api.DistributionSummary;
 import com.netflix.spectator.api.Gauge;
 import com.netflix.spectator.api.Id;
 import com.netflix.spectator.api.Measurement;
+import com.netflix.spectator.api.Meter;
+import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.Tag;
 import com.netflix.spectator.api.Timer;
+import com.netflix.spectator.atlas.impl.Consolidator;
 import com.netflix.spectator.atlas.impl.EvalPayload;
 import com.netflix.spectator.atlas.impl.Evaluator;
 import com.netflix.spectator.atlas.impl.MeasurementSerializer;
 import com.netflix.spectator.atlas.impl.PublishPayload;
-import com.netflix.spectator.atlas.impl.Subscription;
-import com.netflix.spectator.atlas.impl.TagsValuePair;
 import com.netflix.spectator.impl.AsciiSet;
 import com.netflix.spectator.impl.Scheduler;
 import com.netflix.spectator.ipc.http.HttpClient;
 import com.netflix.spectator.ipc.http.HttpResponse;
 
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 
 /**
  * Registry for reporting metrics to Atlas.
  */
-public final class AtlasRegistry extends AbstractRegistry {
+@Singleton
+public final class AtlasRegistry extends AbstractRegistry implements AutoCloseable {
 
   private static final String CLOCK_SKEW_TIMER = "spectator.atlas.clockSkew";
+  private static final String PUBLISH_TASK_TIMER = "spectator.atlas.publishTaskTime";
 
   private final Clock stepClock;
 
@@ -68,6 +82,8 @@ public final class AtlasRegistry extends AbstractRegistry {
   private final long meterTTL;
   private final URI uri;
 
+  private final Duration lwcStep;
+  private final long lwcStepMillis;
   private final Duration configRefreshFrequency;
   private final URI evalUri;
 
@@ -77,28 +93,51 @@ public final class AtlasRegistry extends AbstractRegistry {
   private final int numThreads;
   private final Map<String, String> commonTags;
 
-  private final AsciiSet charset;
-  private final Map<String, AsciiSet> overrides;
+  private final Function<String, String> fixTagString;
 
   private final ObjectMapper jsonMapper;
   private final ObjectMapper smileMapper;
 
+  private final Registry debugRegistry;
+  private final ValidationHelper validationHelper;
+
+  private final RollupPolicy rollupPolicy;
+
   private final HttpClient client;
 
   private Scheduler scheduler;
+  private ExecutorService senderPool;
 
   private final SubscriptionManager subManager;
+  private final Evaluator evaluator;
+
+  private long lastPollTimestamp = -1L;
+  private final Map<Id, Consolidator> atlasMeasurements = new LinkedHashMap<>();
+
+  private final StreamHelper streamHelper = new StreamHelper();
 
   /** Create a new instance. */
+  @Inject
   public AtlasRegistry(Clock clock, AtlasConfig config) {
-    super(clock, config);
+    super(new OverridableClock(clock), config);
     this.config = config;
-    this.stepClock = new StepClock(clock, config.step().toMillis());
+    this.stepClock = new StepClock(clock, config.lwcStep().toMillis());
 
     this.step = config.step();
     this.stepMillis = step.toMillis();
     this.meterTTL = config.meterTTL().toMillis();
     this.uri = URI.create(config.uri());
+
+    this.lwcStep = config.lwcStep();
+    this.lwcStepMillis = lwcStep.toMillis();
+    if (lwcStepMillis > stepMillis) {
+      throw new IllegalArgumentException(
+          "lwcStep cannot be larger than step (" + lwcStep + " > " + step + ")");
+    }
+    if (stepMillis % lwcStepMillis != 0) {
+      throw new IllegalArgumentException(
+          "step is not an even multiple of lwcStep (" + step + " % " + lwcStep + " != 0)");
+    }
 
     this.configRefreshFrequency = config.configRefreshFrequency();
     this.evalUri = URI.create(config.evalUri());
@@ -109,18 +148,34 @@ public final class AtlasRegistry extends AbstractRegistry {
     this.numThreads = config.numThreads();
     this.commonTags = new TreeMap<>(config.commonTags());
 
-    this.charset = AsciiSet.fromPattern(config.validTagCharacters());
-    this.overrides = config.validTagValueCharacters()
-        .keySet().stream()
-        .collect(Collectors.toMap(k -> k, AsciiSet::fromPattern));
+    this.fixTagString = createReplacementFunction(config.validTagCharacters());
     SimpleModule module = new SimpleModule()
-        .addSerializer(Measurement.class, new MeasurementSerializer(charset, overrides));
+        .addSerializer(Measurement.class, new MeasurementSerializer(fixTagString));
     this.jsonMapper = new ObjectMapper(new JsonFactory()).registerModule(module);
     this.smileMapper = new ObjectMapper(new SmileFactory()).registerModule(module);
 
-    this.client = HttpClient.create(this);
+    this.debugRegistry = Optional.ofNullable(config.debugRegistry()).orElse(this);
+    this.validationHelper = new ValidationHelper(logger, jsonMapper, debugRegistry);
+
+    this.rollupPolicy = config.rollupPolicy();
+
+    this.client = HttpClient.create(debugRegistry);
 
     this.subManager = new SubscriptionManager(jsonMapper, client, clock, config);
+    this.evaluator = new Evaluator(commonTags, this::toMap, lwcStepMillis);
+
+    if (config.autoStart()) {
+      start();
+    }
+  }
+
+  private Function<String, String> createReplacementFunction(String pattern) {
+    if (pattern == null) {
+      return Function.identity();
+    } else {
+      AsciiSet set = AsciiSet.fromPattern(pattern);
+      return s -> set.replaceNonMembers(s, '_');
+    }
   }
 
   /**
@@ -128,17 +183,38 @@ public final class AtlasRegistry extends AbstractRegistry {
    */
   public void start() {
     if (scheduler == null) {
+      logger.info("common tags: {}", commonTags);
+
+      // Thread pool for encoding the requests and sending
+      ThreadFactory factory = new ThreadFactory() {
+        private final AtomicInteger next = new AtomicInteger();
+
+        @Override public Thread newThread(Runnable r) {
+          final String name = "spectator-atlas-publish-" + next.getAndIncrement();
+          final Thread t = new Thread(r, name);
+          t.setDaemon(true);
+          return t;
+        }
+      };
+      senderPool = Executors.newFixedThreadPool(numThreads, factory);
+
       // Setup main collection for publishing to Atlas
       Scheduler.Options options = new Scheduler.Options()
           .withFrequency(Scheduler.Policy.FIXED_RATE_SKIP_IF_LONG, step)
-          .withInitialDelay(Duration.ofMillis(getInitialDelay(stepMillis)))
+          .withInitialDelay(Duration.ofMillis(config.initialPollingDelay(clock(), stepMillis)))
           .withStopOnFailure(false);
-      scheduler = new Scheduler(this, "spectator-reg-atlas", numThreads);
-      scheduler.schedule(options, this::collectData);
+      scheduler = new Scheduler(debugRegistry, "spectator-reg-atlas", numThreads);
+      scheduler.schedule(options, this::sendToAtlas);
       logger.info("started collecting metrics every {} reporting to {}", step, uri);
-      logger.info("common tags: {}", commonTags);
 
-      // Setup collection for subscriptions
+      // Setup collection for LWC
+      Scheduler.Options lwcOptions = new Scheduler.Options()
+          .withFrequency(Scheduler.Policy.FIXED_RATE_SKIP_IF_LONG, lwcStep)
+          .withInitialDelay(Duration.ofMillis(config.initialPollingDelay(clock(), lwcStepMillis)))
+          .withStopOnFailure(false);
+      scheduler.schedule(lwcOptions, this::sendToLWC);
+
+      // Setup refresh of LWC subscription data
       Scheduler.Options subOptions = new Scheduler.Options()
           .withFrequency(Scheduler.Policy.FIXED_DELAY, configRefreshFrequency)
           .withStopOnFailure(false);
@@ -149,31 +225,10 @@ public final class AtlasRegistry extends AbstractRegistry {
   }
 
   /**
-   * Avoid collecting right on boundaries to minimize transitions on step longs
-   * during a collection. Randomly distribute across the middle of the step interval.
-   */
-  long getInitialDelay(long stepSize) {
-    long now = clock().wallTime();
-    long stepBoundary = now / stepSize * stepSize;
-
-    // Buffer by 10% of the step interval on either side
-    long offset = stepSize / 10;
-
-    // Check if the current delay is within the acceptable range
-    long delay = now - stepBoundary;
-    if (delay < offset) {
-      return delay + offset;
-    } else if (delay > stepSize - offset) {
-      return stepSize - offset;
-    } else {
-      return delay;
-    }
-  }
-
-  /**
    * Stop the scheduler reporting Atlas data.
    */
   public void stop() {
+    // Shutdown backround tasks to collect data
     if (scheduler != null) {
       scheduler.shutdown();
       scheduler = null;
@@ -181,46 +236,184 @@ public final class AtlasRegistry extends AbstractRegistry {
     } else {
       logger.warn("registry stopped, but was never started");
     }
+
+    // Flush data to Atlas
+    try {
+      logger.info("flushing data for final interval to Atlas");
+      OverridableClock overridableClock = (OverridableClock) clock();
+      long now = clock().wallTime();
+      overridableClock.setWallTime(now / lwcStepMillis * lwcStepMillis + lwcStepMillis);
+      pollMeters(overridableClock.wallTime());
+      overridableClock.setWallTime(now / stepMillis * stepMillis + stepMillis);
+      sendToAtlas();
+    } catch (Exception e) {
+      logger.warn("failed to flush data to Atlas", e);
+    }
+
+    // Shutdown pool used for sending metrics
+    if (senderPool != null) {
+      senderPool.shutdown();
+      senderPool = null;
+    }
   }
 
-  /** Collect data and send to Atlas. */
-  void collectData() {
-    // Send data for any subscriptions
-    if (config.lwcEnabled()) {
-      try {
-        handleSubscriptions();
-      } catch (Exception e) {
-        logger.warn("failed to handle subscriptions", e);
-      }
-    } else {
-      logger.debug("lwc is disabled, skipping subscriptions");
-    }
+  /**
+   * Stop the scheduler reporting Atlas data. This is the same as calling {@link #stop()} and
+   * is included to allow the registry to be stopped correctly when used with DI frameworks that
+   * support lifecycle management.
+   */
+  @Override public void close() {
+    stop();
+  }
 
-    // Publish to Atlas
-    if (config.enabled()) {
+  /** Returns the timestamp of the last completed interval for the specified step size. */
+  private long lastCompletedTimestamp(long s) {
+    long now = clock().wallTime();
+    return now / s * s;
+  }
+
+  private Timer publishTaskTimer(String id) {
+    return debugRegistry.timer(PUBLISH_TASK_TIMER, "id", id);
+  }
+
+  /**
+   * Optimization to reduce the allocations for encoding the payload. The ByteArrayOutputStreams
+   * get reused to avoid the allocations for growing the buffer. In addition, the data is gzip
+   * compressed inline rather than relying on the HTTP client to do it. This reduces the buffer
+   * sizes and avoids another copy step and allocation for creating the compressed buffer.
+   */
+  private byte[] encodeBatch(PublishPayload payload) throws IOException {
+    ByteArrayOutputStream baos = streamHelper.getOrCreateStream();
+    try (GzipLevelOutputStream out = new GzipLevelOutputStream(baos)) {
+      smileMapper.writeValue(out, payload);
+    }
+    return baos.toByteArray();
+  }
+
+  private void sendBatch(RollupPolicy.Result batch) {
+    publishTaskTimer("sendBatch").record(() -> {
       try {
-        for (List<Measurement> batch : getBatches()) {
-          PublishPayload p = new PublishPayload(commonTags, batch);
-          if (logger.isTraceEnabled()) {
-            logger.trace("publish payload: {}", jsonMapper.writeValueAsString(p));
-          }
-          HttpResponse res = client.post(uri)
-              .withConnectTimeout(connectTimeout)
-              .withReadTimeout(readTimeout)
-              .withContent("application/x-jackson-smile", smileMapper.writeValueAsBytes(p))
-              .send();
-          Instant date = res.dateHeader("Date");
-          recordClockSkew((date == null) ? 0L : date.toEpochMilli());
+        PublishPayload p = new PublishPayload(batch.commonTags(), batch.measurements());
+        if (logger.isTraceEnabled()) {
+          logger.trace("publish payload: {}", jsonMapper.writeValueAsString(p));
         }
+        HttpResponse res = client.post(uri)
+            .withConnectTimeout(connectTimeout)
+            .withReadTimeout(readTimeout)
+            .addHeader("Content-Encoding", "gzip")
+            .withContent("application/x-jackson-smile", encodeBatch(p))
+            .send();
+        Instant date = res.dateHeader("Date");
+        recordClockSkew((date == null) ? 0L : date.toEpochMilli());
+        validationHelper.recordResults(batch.measurements().size(), res);
       } catch (Exception e) {
         logger.warn("failed to send metrics (uri={})", uri, e);
+        validationHelper.incrementDroppedHttp(batch.measurements().size());
       }
-    } else {
-      logger.debug("publishing is disabled, skipping collection");
-    }
+    });
+  }
 
-    // Clean up any expired meters
-    removeExpiredMeters();
+  void sendToAtlas() {
+    publishTaskTimer("sendToAtlas").record(() -> {
+      if (config.enabled() && senderPool != null) {
+        long t = lastCompletedTimestamp(stepMillis);
+        pollMeters(t);
+        logger.debug("sending to Atlas for time: {}", t);
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (RollupPolicy.Result batch : getBatches(t)) {
+          CompletableFuture<Void> future = CompletableFuture.runAsync(
+              () -> sendBatch(batch), senderPool);
+          futures.add(future);
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+      } else {
+        logger.debug("publishing is disabled, skipping collection");
+      }
+
+      // Clean up any expired meters, do this regardless of whether it is enabled to avoid
+      // a memory leak
+      removeExpiredMeters();
+    });
+  }
+
+  private void sendBatchLWC(EvalPayload batch) {
+    publishTaskTimer("sendBatchLWC").record(() -> {
+      try {
+        String json = jsonMapper.writeValueAsString(batch);
+        if (logger.isTraceEnabled()) {
+          logger.trace("eval payload: {}", json);
+        }
+        client.post(evalUri)
+            .withConnectTimeout(connectTimeout)
+            .withReadTimeout(readTimeout)
+            .withJsonContent(json)
+            .send();
+      } catch (Exception e) {
+        logger.warn("failed to send metrics for subscriptions (uri={})", evalUri, e);
+      }
+    });
+  }
+
+  void sendToLWC() {
+    publishTaskTimer("sendToLWC").record(() -> {
+      long t = lastCompletedTimestamp(lwcStepMillis);
+      //if (config.enabled() || config.lwcEnabled()) {
+      // If either are enabled we poll the meters for each step interval to flush the
+      // data into the consolidator
+      // NOTE: temporarily to avoid breaking some internal use-cases, the meters will always
+      // be polled to ensure the consolidated values for the main publishing path will be
+      // correct. Once those use-cases have been transitioned the condition should be enabled
+      // again.
+      pollMeters(t);
+      //}
+      if (config.lwcEnabled()) {
+        logger.debug("sending to LWC for time: {}", t);
+        try {
+          EvalPayload payload = evaluator.eval(t);
+          if (!payload.getMetrics().isEmpty()) {
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            for (EvalPayload batch : payload.toBatches(batchSize)) {
+              CompletableFuture<Void> future = CompletableFuture.runAsync(
+                  () -> sendBatchLWC(batch), senderPool);
+              futures.add(future);
+            }
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+          }
+        } catch (Exception e) {
+          logger.warn("failed to send metrics for subscriptions (uri={})", evalUri, e);
+        }
+      } else {
+        logger.debug("lwc is disabled, skipping subscriptions");
+      }
+    });
+  }
+
+  /** Collect measurements from all of the meters in the registry. */
+  synchronized void pollMeters(long t) {
+    publishTaskTimer("pollMeters").record(() -> {
+      if (t > lastPollTimestamp) {
+        MeasurementConsumer consumer = (id, timestamp, value) -> {
+          // Update the map for data to go to the Atlas storage layer
+          Consolidator consolidator = atlasMeasurements.get(id);
+          if (consolidator == null) {
+            int multiple = (int) (stepMillis / lwcStepMillis);
+            consolidator = Consolidator.create(id, stepMillis, multiple);
+            atlasMeasurements.put(id, consolidator);
+          }
+          consolidator.update(timestamp, value);
+
+          // Update aggregators for streaming
+          evaluator.update(id, timestamp, value);
+        };
+        logger.debug("collecting measurements for time: {}", t);
+        publishTaskTimer("pollMeasurements").record(() -> {
+          for (Meter meter : this) {
+            ((AtlasMeter) meter).measure(consumer);
+          }
+        });
+        lastPollTimestamp = t;
+      }
+    });
   }
 
   /**
@@ -234,34 +427,10 @@ public final class AtlasRegistry extends AbstractRegistry {
     super.removeExpiredMeters();
   }
 
-  private void handleSubscriptions() {
-    List<Subscription> subs = subManager.subscriptions();
-    if (!subs.isEmpty()) {
-      List<TagsValuePair> ms = getMeasurements()
-          .map(this::newTagsValuePair)
-          .collect(Collectors.toList());
-      Evaluator evaluator = new Evaluator().addGroupSubscriptions("local", subs);
-      EvalPayload payload = evaluator.eval("local", stepClock.wallTime(), ms);
-      try {
-        String json = jsonMapper.writeValueAsString(payload);
-        if (logger.isTraceEnabled()) {
-          logger.trace("eval payload: {}", json);
-        }
-        client.post(evalUri)
-            .withConnectTimeout(connectTimeout)
-            .withReadTimeout(readTimeout)
-            .withJsonContent(json)
-            .send()
-            .decompress();
-      } catch (Exception e) {
-        logger.warn("failed to send metrics for subscriptions (uri={})", evalUri, e);
-      }
-    }
-  }
-
   private void fetchSubscriptions() {
     if (config.lwcEnabled()) {
       subManager.refresh();
+      evaluator.sync(subManager.subscriptions());
     } else {
       logger.debug("lwc is disabled, skipping subscription config refresh");
     }
@@ -283,12 +452,12 @@ public final class AtlasRegistry extends AbstractRegistry {
         // Local clock is running fast compared to the server. Note this should also be the
         // common case for if the clocks are in sync as there will be some delay for the server
         // response to reach this node.
-        timer(CLOCK_SKEW_TIMER, "id", "fast").record(delta, TimeUnit.MILLISECONDS);
+        debugRegistry.timer(CLOCK_SKEW_TIMER, "id", "fast").record(delta, TimeUnit.MILLISECONDS);
       } else {
         // Local clock is running slow compared to the server. This means the response timestamp
         // appears to be after the current time on this node. The timer will ignore negative
         // values so we negate and record it with a different id.
-        timer(CLOCK_SKEW_TIMER, "id", "slow").record(-delta, TimeUnit.MILLISECONDS);
+        debugRegistry.timer(CLOCK_SKEW_TIMER, "id", "slow").record(-delta, TimeUnit.MILLISECONDS);
       }
       logger.debug("clock skew between client and server: {}ms", delta);
     }
@@ -298,61 +467,94 @@ public final class AtlasRegistry extends AbstractRegistry {
     Map<String, String> tags = new HashMap<>();
 
     for (Tag t : id.tags()) {
-      String k = charset.replaceNonMembers(t.key(), '_');
-      String v = overrides.getOrDefault(k, charset).replaceNonMembers(t.value(), '_');
+      String k = fixTagString.apply(t.key());
+      String v = fixTagString.apply(t.value());
       tags.put(k, v);
     }
 
-    String name = overrides.getOrDefault("name", charset).replaceNonMembers(id.name(), '_');
+    String name = fixTagString.apply(id.name());
     tags.put("name", name);
 
     return tags;
   }
 
-  private TagsValuePair newTagsValuePair(Measurement m) {
-    Map<String, String> tags = toMap(m.id());
-    tags.putAll(commonTags);
-    return new TagsValuePair(tags, m.value());
-  }
+  /**
+   * Get a list of all consolidated measurements intended to be sent to Atlas and break them
+   * into batches.
+   */
+  synchronized List<RollupPolicy.Result> getBatches(long t) {
+    List<RollupPolicy.Result> batches = new ArrayList<>();
+    publishTaskTimer("getBatches").record(() -> {
+      int n = atlasMeasurements.size();
+      debugRegistry.distributionSummary("spectator.registrySize").record(n);
+      List<Measurement> input = new ArrayList<>(n);
+      Iterator<Map.Entry<Id, Consolidator>> it = atlasMeasurements.entrySet().iterator();
+      while (it.hasNext()) {
+        Map.Entry<Id, Consolidator> entry = it.next();
+        Consolidator consolidator = entry.getValue();
 
-  /** Get a list of all measurements from the registry. */
-  Stream<Measurement> getMeasurements() {
-    return stream()
-        .filter(m -> !m.hasExpired())
-        .flatMap(m -> StreamSupport.stream(m.measure().spliterator(), false))
-        .filter(m -> !Double.isNaN(m.value()));
-  }
+        // Ensure it has been updated for this interval
+        consolidator.update(t, Double.NaN);
 
-  /** Get a list of all measurements and break them into batches. */
-  List<List<Measurement>> getBatches() {
-    List<List<Measurement>> batches = new ArrayList<>();
-    List<Measurement> ms = getMeasurements().collect(Collectors.toList());
-    for (int i = 0; i < ms.size(); i += batchSize) {
-      List<Measurement> batch = ms.subList(i, Math.min(ms.size(), i + batchSize));
-      batches.add(batch);
-    }
+        // Add the measurement to the list
+        double v = consolidator.value(t);
+        if (!Double.isNaN(v)) {
+          input.add(new Measurement(entry.getKey(), t, v));
+        }
+
+        // Clean up if there is no longer a need to preserve the state for this id
+        if (consolidator.isEmpty()) {
+          it.remove();
+        }
+      }
+
+      List<RollupPolicy.Result> results = rollupPolicy.apply(input);
+      int rollupSize = results.stream().mapToInt(r -> r.measurements().size()).sum();
+      debugRegistry.distributionSummary("spectator.rollupResultSize").record(rollupSize);
+
+      // Rollup policy can result multiple sets of metrics with different common tags. Batches
+      // are computed using sets with the same common tags. This avoids needing to merge the
+      // common tags into the ids and the larger payloads that would result from replicating them
+      // on all measurements.
+      for (RollupPolicy.Result result : results) {
+        List<Measurement> ms = result.measurements();
+        for (int i = 0; i < ms.size(); i += batchSize) {
+          List<Measurement> batch = ms.subList(i, Math.min(ms.size(), i + batchSize));
+          batches.add(new RollupPolicy.Result(result.commonTags(), batch));
+        }
+      }
+    });
     return batches;
   }
 
+  @Override public Stream<Measurement> measurements() {
+    long t = lastCompletedTimestamp(stepMillis);
+    pollMeters(t);
+    removeExpiredMeters();
+    // Return the flattened list of measurements. Do not merge common tags into the result
+    // as that is an internal detail and not expected by the user.
+    return getBatches(t).stream().flatMap(r -> r.measurements().stream());
+  }
+
   @Override protected Counter newCounter(Id id) {
-    return new AtlasCounter(id, clock(), meterTTL, stepMillis);
+    return new AtlasCounter(this, id, clock(), meterTTL, lwcStepMillis);
   }
 
   @Override protected DistributionSummary newDistributionSummary(Id id) {
-    return new AtlasDistributionSummary(id, clock(), meterTTL, stepMillis);
+    return new AtlasDistributionSummary(id, clock(), meterTTL, lwcStepMillis);
   }
 
   @Override protected Timer newTimer(Id id) {
-    return new AtlasTimer(id, clock(), meterTTL, stepMillis);
+    return new AtlasTimer(id, clock(), meterTTL, lwcStepMillis);
   }
 
   @Override protected Gauge newGauge(Id id) {
     // Be sure to get StepClock so the measurements will have step aligned
     // timestamps.
-    return new AtlasGauge(id, stepClock, meterTTL);
+    return new AtlasGauge(this, id, stepClock, meterTTL);
   }
 
   @Override protected Gauge newMaxGauge(Id id) {
-    return new AtlasMaxGauge(id, clock(), meterTTL, stepMillis);
+    return new AtlasMaxGauge(this, id, clock(), meterTTL, lwcStepMillis);
   }
 }

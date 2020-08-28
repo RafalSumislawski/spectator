@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ArrayTagSetTest {
 
@@ -73,6 +75,18 @@ public class ArrayTagSetTest {
   @Test
   public void testNullValue() {
     Assertions.assertThrows(NullPointerException.class, () -> ArrayTagSet.create("k", null));
+  }
+
+  @Test
+  public void testAddNullKey() {
+    ArrayTagSet ts = ArrayTagSet.EMPTY;
+    Assertions.assertThrows(NullPointerException.class, () -> ts.add(null, "v"));
+  }
+
+  @Test
+  public void testAddNullValue() {
+    ArrayTagSet ts = ArrayTagSet.EMPTY;
+    Assertions.assertThrows(NullPointerException.class, () -> ts.add("k", null));
   }
 
   @Test
@@ -315,6 +329,14 @@ public class ArrayTagSetTest {
   }
 
   @Test
+  public void addAllStringArrayMutate() {
+    String[] vs = {"a", "b"};
+    ArrayTagSet ts = ArrayTagSet.EMPTY.addAll(vs);
+    vs[0] = "c";
+    Assertions.assertEquals(ArrayTagSet.create("a", "b"), ts);
+  }
+
+  @Test
   public void addAllIterable() {
     // Add an arbitrary iterable that isn't a collection or ArrayTagSet
     Collection<Tag> tags = Collections.singletonList(new BasicTag("app", "foo"));
@@ -337,5 +359,112 @@ public class ArrayTagSetTest {
         .add(new BasicTag("a", "6"))
         .add(new BasicTag("b", "1"));
     Assertions.assertEquals(expected, ts);
+  }
+
+  @Test
+  public void tagListIterate() {
+    ArrayTagSet expected = ArrayTagSet.create("a", "1", "b", "2", "c", "3", "d", "4", "e", "5");
+    ArrayTagSet actual = ArrayTagSet.EMPTY;
+    for (Tag t : expected) {
+      actual = actual.add(t);
+    }
+    Assertions.assertEquals(expected, actual);
+  }
+
+  @Test
+  public void tagListForEach() {
+    ArrayTagSet expected = ArrayTagSet.create("a", "1", "b", "2", "c", "3", "d", "4", "e", "5");
+    List<Tag> tmp = new ArrayList<>();
+    expected.forEach((k, v) -> tmp.add(Tag.of(k, v)));
+    Assertions.assertEquals(expected, ArrayTagSet.create(tmp));
+  }
+
+  @Test
+  public void tagListFilter() {
+    ArrayTagSet filtered = ArrayTagSet
+        .create("a", "1", "b", "2", "c", "3")
+        .filter((k, v) -> !v.equals("2"));
+    Assertions.assertEquals(ArrayTagSet.create("a", "1", "c", "3"), filtered);
+  }
+
+  @Test
+  public void tagListFilterMatchAll() {
+    ArrayTagSet filtered = ArrayTagSet
+        .create("a", "1", "b", "2", "c", "3")
+        .filter((k, v) -> true);
+    Assertions.assertEquals(ArrayTagSet.create("a", "1", "b", "2", "c", "3"), filtered);
+  }
+
+  @Test
+  public void tagListFilterMatchNone() {
+    ArrayTagSet filtered = ArrayTagSet
+        .create("a", "1", "b", "2", "c", "3")
+        .filter((k, v) -> false);
+    Assertions.assertEquals(ArrayTagSet.EMPTY, filtered);
+  }
+
+  @Test
+  public void tagListFilterByKey() {
+    ArrayTagSet filtered = ArrayTagSet
+        .create("a", "1", "b", "2", "c", "3")
+        .filterByKey(k -> !k.equals("b"));
+    Assertions.assertEquals(ArrayTagSet.create("a", "1", "c", "3"), filtered);
+  }
+
+  @Test
+  public void tagListFilterByKeyMatchAll() {
+    ArrayTagSet filtered = ArrayTagSet
+        .create("a", "1", "b", "2", "c", "3")
+        .filterByKey(k -> true);
+    Assertions.assertEquals(ArrayTagSet.create("a", "1", "b", "2", "c", "3"), filtered);
+  }
+
+  @Test
+  public void tagListFilterByKeyMatchNone() {
+    ArrayTagSet filtered = ArrayTagSet
+        .create("a", "1", "b", "2", "c", "3")
+        .filterByKey(k -> false);
+    Assertions.assertEquals(ArrayTagSet.EMPTY, filtered);
+  }
+
+  @Test
+  public void addAllConcurrentMap() {
+    Map<String, String> tags = new ConcurrentHashMap<>();
+    tags.put("app", "foo");
+    ArrayTagSet ts = ArrayTagSet.EMPTY.addAll(tags);
+    Assertions.assertEquals(ArrayTagSet.EMPTY.add("app", "foo"), ts);
+  }
+
+  @Test
+  public void addAllConcurrentMapFailure() throws InterruptedException {
+    // This test just checks that we do not throw if the map is being modified concurrently.
+    // It seems to fail reliably when testing prior to the patch.
+    // https://github.com/Netflix/spectator/issues/733
+    final AtomicBoolean done = new AtomicBoolean(false);
+    final Map<String, String> tags = new ConcurrentHashMap<>();
+
+    Thread t1 = new Thread(() -> {
+      while (!done.get()) {
+        tags.remove("app");
+      }
+    });
+    t1.start();
+
+    Thread t2 = new Thread(() -> {
+      while (!done.get()) {
+        tags.put("app", "foo");
+      }
+    });
+    t2.start();
+
+    try {
+      for (int i = 0; i < 10_000; ++i) {
+        ArrayTagSet.EMPTY.addAll(tags);
+      }
+    } finally {
+      done.set(true);
+      t1.join();
+      t2.join();
+    }
   }
 }

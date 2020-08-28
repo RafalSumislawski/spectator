@@ -16,6 +16,7 @@
 package com.netflix.spectator.api;
 
 import com.netflix.spectator.api.patterns.PolledMeter;
+import com.netflix.spectator.impl.Cache;
 import com.netflix.spectator.impl.Config;
 import com.netflix.spectator.impl.Preconditions;
 import org.slf4j.Logger;
@@ -26,12 +27,17 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 /**
  * Base class to make it easier to implement a simple registry that only needs to customise the
  * types returned for Counter, DistributionSummary, and Timer calls.
  */
 public abstract class AbstractRegistry implements Registry {
+
+  /** Not used for this registry, always return 0. */
+  private static final LongSupplier VERSION = () -> 0L;
+
   /** Logger instance for the class. */
   protected final Logger logger;
 
@@ -40,6 +46,8 @@ public abstract class AbstractRegistry implements Registry {
 
   private final ConcurrentHashMap<Id, Meter> meters;
   private final ConcurrentHashMap<Id, Object> state;
+
+  private final Cache<Id, Id> idNormalizationCache;
 
   /**
    * Create a new instance.
@@ -65,6 +73,7 @@ public abstract class AbstractRegistry implements Registry {
     this.config = config;
     this.meters = new ConcurrentHashMap<>();
     this.state = new ConcurrentHashMap<>();
+    this.idNormalizationCache = Cache.lfu(new NoopRegistry(), "spectator-id", 1000, 10000);
   }
 
   /**
@@ -133,6 +142,19 @@ public abstract class AbstractRegistry implements Registry {
     return new DefaultId(name, ArrayTagSet.create(tags));
   }
 
+  /**
+   * Ensure a the id type is correct. While not recommended, nothing stops users from using a
+   * custom implementation of the {@link Id} interface. This can create unexpected and strange
+   * problems with the lookups failing, duplicate counters, etc. To avoid issues, this method
+   * should be called to sanitize Id values coming from the user. If it is already a valid id,
+   * then it will not create a new instance.
+   */
+  private Id normalizeId(Id id) {
+    return (id instanceof DefaultId)
+        ? id
+        : idNormalizationCache.computeIfAbsent(id, i -> createId(i.name(), i.tags()));
+  }
+
   private void logTypeError(Id id, Class<?> desired, Class<?> found) {
     final String dtype = desired.getName();
     final String ftype = found.getName();
@@ -154,32 +176,37 @@ public abstract class AbstractRegistry implements Registry {
   }
 
   @Override public final Counter counter(Id id) {
-    Counter c = getOrCreate(id, Counter.class, NoopCounter.INSTANCE, this::newCounter);
-    return new SwapCounter(this, id, c);
+    Id normId = normalizeId(id);
+    Counter c = getOrCreate(normId, Counter.class, NoopCounter.INSTANCE, this::newCounter);
+    return new SwapCounter(this, VERSION, normId, c);
   }
 
   @Override public final DistributionSummary distributionSummary(Id id) {
+    Id normId = normalizeId(id);
     DistributionSummary ds = getOrCreate(
-        id,
+        normId,
         DistributionSummary.class,
         NoopDistributionSummary.INSTANCE,
         this::newDistributionSummary);
-    return new SwapDistributionSummary(this, id, ds);
+    return new SwapDistributionSummary(this, VERSION, normId, ds);
   }
 
   @Override public final Timer timer(Id id) {
-    Timer t = getOrCreate(id, Timer.class, NoopTimer.INSTANCE, this::newTimer);
-    return new SwapTimer(this, id, t);
+    Id normId = normalizeId(id);
+    Timer t = getOrCreate(normId, Timer.class, NoopTimer.INSTANCE, this::newTimer);
+    return new SwapTimer(this, VERSION, normId, t);
   }
 
   @Override public final Gauge gauge(Id id) {
-    Gauge g = getOrCreate(id, Gauge.class, NoopGauge.INSTANCE, this::newGauge);
-    return new SwapGauge(this, id, g);
+    Id normId = normalizeId(id);
+    Gauge g = getOrCreate(normId, Gauge.class, NoopGauge.INSTANCE, this::newGauge);
+    return new SwapGauge(this, VERSION, normId, g);
   }
 
   @Override public final Gauge maxGauge(Id id) {
-    Gauge g = getOrCreate(id, Gauge.class, NoopGauge.INSTANCE, this::newMaxGauge);
-    return new SwapMaxGauge(this, id, g);
+    Id normId = normalizeId(id);
+    Gauge g = getOrCreate(normId, Gauge.class, NoopGauge.INSTANCE, this::newMaxGauge);
+    return new SwapMaxGauge(this, VERSION, normId, g);
   }
 
   /**
@@ -217,7 +244,7 @@ public abstract class AbstractRegistry implements Registry {
   }
 
   @Override public final Meter get(Id id) {
-    return meters.get(id);
+    return meters.get(normalizeId(id));
   }
 
   @Override public final Iterator<Meter> iterator() {

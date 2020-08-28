@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,33 +15,67 @@
  */
 package com.netflix.spectator.atlas;
 
+import com.netflix.spectator.api.Clock;
 import com.netflix.spectator.api.ManualClock;
 import com.netflix.spectator.api.Measurement;
+import com.netflix.spectator.api.NoopRegistry;
+import com.netflix.spectator.api.Registry;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 
 public class AtlasRegistryTest {
 
-  private ManualClock clock = new ManualClock();
-  private AtlasRegistry registry = new AtlasRegistry(clock, newConfig());
+  private ManualClock clock;
+  private AtlasRegistry registry;
 
   private AtlasConfig newConfig() {
-    ConcurrentHashMap<String, String> props = new ConcurrentHashMap<>();
+    Map<String, String> props = new LinkedHashMap<>();
     props.put("atlas.enabled", "false");
     props.put("atlas.step", "PT10S");
     props.put("atlas.batchSize", "3");
-    return props::get;
+
+    return new AtlasConfig() {
+      @Override public String get(String k) {
+        return props.get(k);
+      }
+
+      @Override public Registry debugRegistry() {
+        return new NoopRegistry();
+      }
+    };
   }
 
   private List<Measurement> getMeasurements() {
-    return registry.getMeasurements().collect(Collectors.toList());
+    return registry.measurements().collect(Collectors.toList());
+  }
+
+  private List<List<Measurement>> getBatches() {
+    long step = 10000;
+    if (clock.wallTime() == 0L) {
+      clock.setWallTime(step);
+    }
+    long t = clock.wallTime() / step * step;
+    registry.pollMeters(t);
+    return registry
+        .getBatches(t)
+        .stream()
+        .map(RollupPolicy.Result::measurements)
+        .collect(Collectors.toList());
+  }
+
+  @BeforeEach
+  public void before() {
+    clock = new ManualClock();
+    registry = new AtlasRegistry(clock, newConfig());
   }
 
   @Test
@@ -87,7 +121,7 @@ public class AtlasRegistryTest {
 
   @Test
   public void batchesEmpty() {
-    Assertions.assertEquals(0, registry.getBatches().size());
+    Assertions.assertEquals(0, getBatches().size());
   }
 
   @Test
@@ -95,8 +129,8 @@ public class AtlasRegistryTest {
     for (int i = 0; i < 9; ++i) {
       registry.counter("" + i).increment();
     }
-    Assertions.assertEquals(3, registry.getBatches().size());
-    for (List<Measurement> batch : registry.getBatches()) {
+    Assertions.assertEquals(3, getBatches().size());
+    for (List<Measurement> batch : getBatches()) {
       Assertions.assertEquals(3, batch.size());
     }
   }
@@ -106,7 +140,7 @@ public class AtlasRegistryTest {
     for (int i = 0; i < 7; ++i) {
       registry.counter("" + i).increment();
     }
-    List<List<Measurement>> batches = registry.getBatches();
+    List<List<Measurement>> batches = getBatches();
     Assertions.assertEquals(3, batches.size());
     for (int i = 0; i < batches.size(); ++i) {
       Assertions.assertEquals((i < 2) ? 3 : 1, batches.get(i).size());
@@ -115,22 +149,35 @@ public class AtlasRegistryTest {
 
   @Test
   public void initialDelayTooCloseToStart() {
-    long d = registry.getInitialDelay(10000);
+    long d = newConfig().initialPollingDelay(clock, 10000);
     Assertions.assertEquals(1000, d);
   }
 
   @Test
   public void initialDelayTooCloseToEnd() {
     clock.setWallTime(19123);
-    long d = registry.getInitialDelay(10000);
+    long d = newConfig().initialPollingDelay(clock, 10000);
     Assertions.assertEquals(9000, d);
   }
 
   @Test
   public void initialDelayOk() {
     clock.setWallTime(12123);
-    long d = registry.getInitialDelay(10000);
+    long d = newConfig().initialPollingDelay(clock, 10000);
     Assertions.assertEquals(2123, d);
+  }
+
+  @Test
+  public void initialDelayTooCloseToStartSmallStep() {
+    long d = newConfig().initialPollingDelay(clock, 5000);
+    Assertions.assertEquals(500, d);
+  }
+
+  @Test
+  public void initialDelayTooCloseToEndSmallStep() {
+    clock.setWallTime(19623);
+    long d = newConfig().initialPollingDelay(clock, 5000);
+    Assertions.assertEquals(877, d);
   }
 
   @Test
@@ -138,13 +185,14 @@ public class AtlasRegistryTest {
     for (int i = 0; i < 9; ++i) {
       registry.counter("" + i).increment();
     }
-    Assertions.assertEquals(3, registry.getBatches().size());
-    for (List<Measurement> batch : registry.getBatches()) {
+    Assertions.assertEquals(3, getBatches().size());
+    for (List<Measurement> batch : getBatches()) {
       Assertions.assertEquals(3, batch.size());
     }
 
     clock.setWallTime(Duration.ofMinutes(15).toMillis() + 1);
-    Assertions.assertEquals(0, registry.getBatches().size());
+    registry.removeExpiredMeters();
+    Assertions.assertEquals(0, getBatches().size());
   }
 
   @Test
@@ -152,8 +200,8 @@ public class AtlasRegistryTest {
     for (int i = 0; i < 9; ++i) {
       registry.counter("" + i).increment();
     }
-    registry.collectData();
-    Assertions.assertEquals(3, registry.getBatches().size());
+    registry.sendToAtlas();
+    Assertions.assertEquals(3, getBatches().size());
   }
 
   @Test
@@ -162,7 +210,15 @@ public class AtlasRegistryTest {
       registry.counter("" + i).increment();
     }
     clock.setWallTime(Duration.ofMinutes(15).toMillis() + 1);
-    registry.collectData();
-    Assertions.assertEquals(0, registry.getBatches().size());
+    registry.sendToAtlas();
+    Assertions.assertEquals(0, getBatches().size());
+  }
+
+  @Test
+  public void shutdownWithoutStarting() {
+    AtlasRegistry r = new AtlasRegistry(
+        Clock.SYSTEM,
+        k -> k.equals("atlas.enabled") ? "true" : null);
+    r.close();
   }
 }

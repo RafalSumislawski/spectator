@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,13 +29,20 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.zip.Deflater;
 
 /**
@@ -50,6 +57,35 @@ public class HttpRequestBuilder {
   private static final Map<String, String> NETFLIX_HEADERS =
       NetflixHeaders.extractFromEnvironment();
 
+  // Should not be used directly, use the method of the same name that will create the
+  // executor if needed on the first access.
+  private static volatile ExecutorService defaultExecutor;
+
+  private static ThreadFactory newThreadFactory() {
+    return new ThreadFactory() {
+      private final AtomicInteger next = new AtomicInteger();
+
+      @Override public Thread newThread(Runnable r) {
+        final String name = "spectator-ipc-" + next.getAndIncrement();
+        final Thread t = new Thread(r, name);
+        t.setDaemon(true);
+        return t;
+      }
+    };
+  }
+
+  private static ExecutorService defaultExecutor() {
+    ExecutorService executor = defaultExecutor;
+    if (executor != null) {
+      return executor;
+    }
+    synchronized (LOGGER) {
+      defaultExecutor = Executors.newFixedThreadPool(
+          Runtime.getRuntime().availableProcessors(), newThreadFactory());
+      return defaultExecutor;
+    }
+  }
+
   private final URI uri;
   private final IpcLogEntry entry;
   private String method = "GET";
@@ -59,8 +95,9 @@ public class HttpRequestBuilder {
   private int connectTimeout = 1000;
   private int readTimeout = 30000;
 
+  private RetryPolicy retryPolicy = RetryPolicy.SAFE;
   private long initialRetryDelay = 1000L;
-  private int numAttempts = 1;
+  private int numAttempts = 3;
 
   private HostnameVerifier hostVerifier = null;
   private SSLSocketFactory sslFactory = null;
@@ -183,6 +220,15 @@ public class HttpRequestBuilder {
     return this;
   }
 
+  /**
+   * Policy to determine whether a given failure can be retried. By default
+   * {@link RetryPolicy#SAFE} is used.
+   */
+  public HttpRequestBuilder retryPolicy(RetryPolicy policy) {
+    this.retryPolicy = policy;
+    return this;
+  }
+
   private void requireHttps(String msg) {
     Preconditions.checkState("https".equals(uri.getScheme()), msg);
   }
@@ -227,7 +273,8 @@ public class HttpRequestBuilder {
       try {
         response = sendImpl();
         int s = response.status();
-        if (s == 429 || s == 503) {
+        boolean shouldRetry = retryPolicy.shouldRetry(method, response);
+        if (shouldRetry && (s == 429 || s == 503)) {
           // Request is getting throttled, exponentially back off
           // - 429 client sending too many requests
           // - 503 server unavailable
@@ -239,16 +286,11 @@ public class HttpRequestBuilder {
             Thread.currentThread().interrupt();
             throw new IOException("request failed " + method + " " + uri, e);
           }
-        } else if (s < 500) {
-          // 4xx errors other than 429 are not considered retriable, so for anything
-          // less than 500 just return the response to the user
+        } else if (!shouldRetry) {
           return response;
         }
       } catch (IOException e) {
-        // All exceptions are considered retriable. Some like UnknownHostException are
-        // debatable, but we have seen them in some cases if there is a high latency for
-        // DNS lookups. So for now assume all exceptions are transient issues.
-        if (attempt == numAttempts) {
+        if (attempt == numAttempts || !retryPolicy.shouldRetry(method, e)) {
           throw e;
         } else {
           LOGGER.warn("attempt {} of {} failed: {} {}", attempt, numAttempts, method, uri);
@@ -261,6 +303,22 @@ public class HttpRequestBuilder {
       throw new IOException("request failed " + method + " " + uri);
     }
     return response;
+  }
+
+  /**
+   * Send the request asynchronously and log/update metrics for the results. The request
+   * will be sent on a background thread pool and will update the future when complete. In
+   * the future it can be changed to use the new HttpClient in Java 11+.
+   */
+  public CompletableFuture<HttpResponse> sendAsync() {
+    Supplier<HttpResponse> responseSupplier = () -> {
+      try {
+        return send();
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    };
+    return CompletableFuture.supplyAsync(responseSupplier, defaultExecutor());
   }
 
   private void configureHTTPS(HttpURLConnection http) {

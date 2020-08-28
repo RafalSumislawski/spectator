@@ -16,15 +16,13 @@
 package com.netflix.spectator.atlas.impl;
 
 import com.fasterxml.jackson.core.JsonGenerator;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonSerializer;
 import com.fasterxml.jackson.databind.SerializerProvider;
+import com.netflix.spectator.api.Id;
 import com.netflix.spectator.api.Measurement;
-import com.netflix.spectator.api.Tag;
-import com.netflix.spectator.impl.AsciiSet;
 
 import java.io.IOException;
-import java.util.Map;
+import java.util.function.Function;
 
 /**
  * Jackson serializer for measurements. Values will be converted to a
@@ -36,48 +34,37 @@ import java.util.Map;
  */
 public class MeasurementSerializer extends JsonSerializer<Measurement> {
 
-  private final AsciiSet set;
-  private final Map<String, AsciiSet> overrides;
+  private final Function<String, String> fixTagString;
 
   /**
    * Create a new instance of the serializer.
    *
-   * @param set
-   *     The set of characters that are allowed to be used for tag keys.
-   * @param overrides
-   *     Overrides for the set of characters allowed to be used for tag values.
+   * @param fixTagString
+   *     Function that fixes characters used for tag keys and values.
    */
-  public MeasurementSerializer(AsciiSet set, Map<String, AsciiSet> overrides) {
+  public MeasurementSerializer(Function<String, String> fixTagString) {
     super();
-    this.set = set;
-    this.overrides = overrides;
-  }
-
-  private String fixKey(String k) {
-    return set.replaceNonMembers(k, '_');
-  }
-
-  private String fixValue(String k, String v) {
-    AsciiSet s = overrides.getOrDefault(k, set);
-    return s.replaceNonMembers(v, '_');
+    this.fixTagString = fixTagString;
   }
 
   @Override
   public void serialize(
       Measurement value,
       JsonGenerator gen,
-      SerializerProvider serializers) throws IOException, JsonProcessingException {
+      SerializerProvider serializers) throws IOException {
+    Id id = value.id();
     gen.writeStartObject();
     gen.writeObjectFieldStart("tags");
-    gen.writeStringField("name", fixValue("name", value.id().name()));
+    gen.writeStringField("name", fixTagString.apply(id.name()));
     boolean explicitDsType = false;
-    for (Tag t : value.id().tags()) {
-      if (!"name".equals(t.key())) {
-        if ("atlas.dstype".equals(t.key())) {
+    int n = id.size();
+    for (int i = 1; i < n; ++i) {
+      final String k = fixTagString.apply(id.getKey(i));
+      final String v = fixTagString.apply(id.getValue(i));
+      if (!"name".equals(k)) {
+        if ("atlas.dstype".equals(k)) {
           explicitDsType = true;
         }
-        final String k = fixKey(t.key());
-        final String v = fixValue(k, t.value());
         gen.writeStringField(k, v);
       }
     }

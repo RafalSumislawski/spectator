@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2019 Netflix, Inc.
+ * Copyright 2014-2020 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,21 +15,21 @@
  */
 package com.netflix.spectator.api;
 
+import com.netflix.spectator.impl.Preconditions;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Comparator;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.NoSuchElementException;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.BiPredicate;
+import java.util.function.Predicate;
 
 /**
  * An immutable set of tags sorted by the tag key.
  */
-final class ArrayTagSet implements Iterable<Tag> {
-
-  private static final Comparator<Tag> TAG_COMPARATOR = (t1, t2) -> t1.key().compareTo(t2.key());
+final class ArrayTagSet implements TagList {
 
   /** Empty tag set. */
   static final ArrayTagSet EMPTY = new ArrayTagSet(new String[0]);
@@ -75,43 +75,20 @@ final class ArrayTagSet implements Iterable<Tag> {
     this.cachedHashCode = 0;
   }
 
-  @Override public Iterator<Tag> iterator() {
-    return new Iterator<Tag>() {
-      private int i = 0;
-
-      @Override public boolean hasNext() {
-        return i < length;
-      }
-
-      @Override public Tag next() {
-        if (i >= length) {
-          throw new NoSuchElementException("next called after end of iterator");
-        }
-        final String k = tags[i++];
-        final String v = tags[i++];
-        return new BasicTag(k, v);
-      }
-    };
-  }
-
   /** Check if this set is empty. */
   boolean isEmpty() {
     return length == 0;
   }
 
   /** Add a new tag to the set. */
-  ArrayTagSet add(String k, String v) {
-    return add(new BasicTag(k, v));
-  }
-
-  /** Add a new tag to the set. */
   @SuppressWarnings("PMD.AvoidArrayLoops")
-  ArrayTagSet add(Tag tag) {
+  ArrayTagSet add(String k, String v) {
+    Preconditions.checkNotNull(k, "key");
+    Preconditions.checkNotNull(v, "value");
     if (length == 0) {
-      return new ArrayTagSet(new String[] {tag.key(), tag.value()});
+      return new ArrayTagSet(new String[] {k, v});
     } else {
       String[] newTags = new String[length + 2];
-      String k = tag.key();
       int i = 0;
       for (; i < length && tags[i].compareTo(k) < 0; i += 2) {
         newTags[i] = tags[i];
@@ -119,19 +96,24 @@ final class ArrayTagSet implements Iterable<Tag> {
       }
       if (i < length && tags[i].equals(k)) {
         // Override
-        newTags[i++] = tag.key();
-        newTags[i++] = tag.value();
+        newTags[i++] = k;
+        newTags[i++] = v;
         System.arraycopy(tags, i, newTags, i, length - i);
         i = length;
       } else {
         // Insert
-        newTags[i] = tag.key();
-        newTags[i + 1] = tag.value();
+        newTags[i] = k;
+        newTags[i + 1] = v;
         System.arraycopy(tags, i, newTags, i + 2, length - i);
         i = newTags.length;
       }
       return new ArrayTagSet(newTags, i);
     }
+  }
+
+  /** Add a new tag to the set. */
+  ArrayTagSet add(Tag tag) {
+    return add(tag.key(), tag.value());
   }
 
   /** Add a collection of tags to the set. */
@@ -141,13 +123,14 @@ final class ArrayTagSet implements Iterable<Tag> {
       if (data.isEmpty()) {
         return this;
       } else {
-        Tag[] newTags = new Tag[data.size()];
+        String[] newTags = new String[2 * data.size()];
         int i = 0;
         for (Tag t : data) {
-          newTags[i] = BasicTag.convert(t);
-          ++i;
+          newTags[i++] = t.key();
+          newTags[i++] = t.value();
         }
-        return addAll(newTags);
+        checkForNullValues(newTags);
+        return addAll(newTags, newTags.length);
       }
     } else {
       List<Tag> data = new ArrayList<>();
@@ -162,13 +145,24 @@ final class ArrayTagSet implements Iterable<Tag> {
   ArrayTagSet addAll(Map<String, String> ts) {
     if (ts.isEmpty()) {
       return this;
+    } else if (ts instanceof ConcurrentMap) {
+      // Special case ConcurrentMaps to avoid propagating errors if there is a bug in the caller
+      // and the map is mutated while being added:
+      // https://github.com/Netflix/spectator/issues/733
+      List<Tag> data = new ArrayList<>(ts.size());
+      for (Map.Entry<String, String> entry : ts.entrySet()) {
+        data.add(new BasicTag(entry.getKey(), entry.getValue()));
+      }
+      return addAll(data);
     } else {
-      Tag[] newTags = new Tag[ts.size()];
+      String[] newTags = new String[2 * ts.size()];
       int i = 0;
       for (Map.Entry<String, String> entry : ts.entrySet()) {
-        newTags[i++] = new BasicTag(entry.getKey(), entry.getValue());
+        newTags[i++] = entry.getKey();
+        newTags[i++] = entry.getValue();
       }
-      return addAll(newTags);
+      checkForNullValues(newTags);
+      return addAll(newTags, newTags.length);
     }
   }
 
@@ -177,17 +171,24 @@ final class ArrayTagSet implements Iterable<Tag> {
     if (ts.length % 2 != 0) {
       throw new IllegalArgumentException("array length must be even, (length=" + ts.length + ")");
     }
+    checkForNullValues(ts);
+    String[] copy = Arrays.copyOf(ts, ts.length);
+    return addAll(copy, copy.length);
+  }
 
-    if (ts.length == 0) {
+  /** Add a collection of tags to the set. */
+  private ArrayTagSet addAll(String[] ts, int tsLength) {
+    if (tsLength == 0) {
       return this;
+    } else if (length == 0) {
+      insertionSort(ts, tsLength);
+      int len = dedup(ts, 0, ts, 0, tsLength);
+      return new ArrayTagSet(ts, len);
     } else {
-      int tsLength = ts.length / 2;
-      Tag[] newTags = new Tag[tsLength];
-      for (int i = 0; i < tsLength; ++i) {
-        final int j = i * 2;
-        newTags[i] = new BasicTag(ts[j], ts[j + 1]);
-      }
-      return addAll(newTags, tsLength);
+      String[] newTags = new String[(length + tsLength) * 2];
+      insertionSort(ts, tsLength);
+      int newLength = merge(newTags, tags, length, ts, tsLength);
+      return new ArrayTagSet(newTags, newLength);
     }
   }
 
@@ -200,15 +201,10 @@ final class ArrayTagSet implements Iterable<Tag> {
   ArrayTagSet addAll(Tag[] ts, int tsLength) {
     if (tsLength == 0) {
       return this;
-    } else if (length == 0) {
-      Arrays.sort(ts, 0, tsLength, TAG_COMPARATOR);
-      int len = dedup(ts, 0, ts, 0, tsLength);
-      return new ArrayTagSet(toStringArray(ts, len));
     } else {
-      String[] newTags = new String[(length + tsLength) * 2];
-      Arrays.sort(ts, 0, tsLength, TAG_COMPARATOR);
-      int newLength = merge(newTags, tags, length, ts, tsLength);
-      return new ArrayTagSet(newTags, newLength);
+      String[] newTags = toStringArray(ts, tsLength);
+      checkForNullValues(newTags);
+      return addAll(newTags, newTags.length);
     }
   }
 
@@ -221,11 +217,55 @@ final class ArrayTagSet implements Iterable<Tag> {
     return strs;
   }
 
+  private void checkForNullValues(String[] ts) {
+    for (String s : ts) {
+      if (s == null) {
+        throw new NullPointerException("tag keys and values cannot be null");
+      }
+    }
+  }
+
+  /**
+   * Sort a string array that consists of tag key/value pairs by key. The array will be
+   * sorted in-place. Tag lists are supposed to be fairly small, typically less than 20
+   * tags. With the small size a simple insertion sort works well.
+   */
+  private void insertionSort(String[] ts, int length) {
+    if (length == 4) {
+      // Two key/value pairs, swap if needed
+      if (ts[0].compareTo(ts[2]) > 0) {
+        // Swap key
+        String tmp = ts[0];
+        ts[0] = ts[2];
+        ts[2] = tmp;
+
+        // Swap value
+        tmp = ts[1];
+        ts[1] = ts[3];
+        ts[3] = tmp;
+      }
+    } else if (length > 4) {
+      // One entry is already sorted. Two entries handled above, for larger arrays
+      // use insertion sort.
+      for (int i = 2; i < length; i += 2) {
+        String k = ts[i];
+        String v = ts[i + 1];
+        int j = i - 2;
+        for (; j >= 0 && ts[j].compareTo(k) > 0; j -= 2) {
+          ts[j + 2] = ts[j];
+          ts[j + 3] = ts[j + 1];
+        }
+        ts[j + 2] = k;
+        ts[j + 3] = v;
+      }
+    }
+  }
+
   /**
    * Merge and dedup any entries in {@code ts} that have the same key. The last entry
    * with a given key will get selected.
    */
-  private int merge(String[] dst, String[] srcA, int lengthA, Tag[] srcB, int lengthB) {
+  private int merge(String[] dst, String[] srcA, int lengthA, String[] srcB, int lengthB) {
     int i = 0;
     int ai = 0;
     int bi = 0;
@@ -233,25 +273,27 @@ final class ArrayTagSet implements Iterable<Tag> {
     while (ai < lengthA && bi < lengthB) {
       final String ak = srcA[ai];
       final String av = srcA[ai + 1];
-      Tag b = srcB[bi];
-      int cmp = ak.compareTo(b.key());
+      String bk = srcB[bi];
+      String bv = srcB[bi + 1];
+      int cmp = ak.compareTo(bk);
       if (cmp < 0) {
         dst[i++] = ak;
         dst[i++] = av;
         ai += 2;
       } else if (cmp > 0) {
-        dst[i++] = b.key();
-        dst[i++] = b.value();
-        ++bi;
+        dst[i++] = bk;
+        dst[i++] = bv;
+        bi += 2;
       } else {
         // Newer tags should override, use source B if there are duplicate keys.
         // If source B has duplicates, then use the last value for the given key.
-        int j = bi + 1;
-        for (; j < lengthB && ak.equals(srcB[j].key()); ++j) {
-          b = srcB[j];
+        int j = bi + 2;
+        for (; j < lengthB && ak.equals(srcB[j]); j += 2) {
+          bk = srcB[j];
+          bv = srcB[j + 1];
         }
-        dst[i++] = b.key();
-        dst[i++] = b.value();
+        dst[i++] = bk;
+        dst[i++] = bv;
         bi = j;
         ai += 2; // Ignore
       }
@@ -272,58 +314,62 @@ final class ArrayTagSet implements Iterable<Tag> {
    * key will get selected. Input data must already be sorted by the tag key. Returns the
    * length of the overall deduped array.
    */
-  private int dedup(Tag[] src, int ss, Tag[] dst, int ds, int len) {
+  private int dedup(String[] src, int ss, String[] dst, int ds, int len) {
     if (len == 0) {
       return ds;
     } else {
-      dst[ds] = src[ss];
-      String k = src[ss].key();
-      int j = ds;
-      final int e = ss + len;
-      for (int i = ss + 1; i < e; ++i) {
-        if (k.equals(src[i].key())) {
-          dst[j] = src[i];
-        } else {
-          k = src[i].key();
-          dst[++j] = src[i];
-        }
-      }
-      return j + 1;
-    }
-  }
-
-  /**
-   * Dedup any entries in {@code ts} that have the same key. The last entry with a given
-   * key will get selected. Input data must already be sorted by the tag key. Returns the
-   * length of the overall deduped array.
-   */
-  private int dedup(Tag[] src, int ss, String[] dst, int ds, int len) {
-    if (len == 0) {
-      return ds;
-    } else {
-      String k = src[ss].key();
+      String k = src[ss];
       dst[ds] = k;
-      dst[ds + 1] = src[ss].value();
+      dst[ds + 1] = src[ss + 1];
       int j = ds;
       final int e = ss + len;
-      for (int i = ss + 1; i < e; ++i) {
-        if (k.equals(src[i].key())) {
-          dst[j] = src[i].key();
-          dst[j + 1] = src[i].value();
+      for (int i = ss + 2; i < e; i += 2) {
+        if (k.equals(src[i])) {
+          dst[j] = src[i];
+          dst[j + 1] = src[i + 1];
         } else {
           j += 2; // Not deduping, skip over previous entry
-          k = src[i].key();
+          k = src[i];
           dst[j] = k;
-          dst[j + 1] = src[i].value();
+          dst[j + 1] = src[i + 1];
         }
       }
       return j + 2;
     }
   }
 
+  /** Return the key at the specified position. */
+  @Override public String getKey(int i) {
+    return tags[i * 2];
+  }
+
+  /** Return the value at the specified position. */
+  @Override public String getValue(int i) {
+    return tags[i * 2 + 1];
+  }
+
   /** Return the current size of this tag set. */
-  public int size() {
+  @Override public int size() {
     return length / 2;
+  }
+
+  @Override public ArrayTagSet filter(BiPredicate<String, String> predicate) {
+    final int n = size();
+    String[] result = new String[2 * n];
+    int pos = 0;
+    for (int i = 0; i < n; ++i) {
+      final String k = getKey(i);
+      final String v = getValue(i);
+      if (predicate.test(k, v)) {
+        result[pos++] = k;
+        result[pos++] = v;
+      }
+    }
+    return new ArrayTagSet(result, pos);
+  }
+
+  @Override public ArrayTagSet filterByKey(Predicate<String> predicate) {
+    return filter((k, v) -> predicate.test(k));
   }
 
   @Override public boolean equals(Object o) {
