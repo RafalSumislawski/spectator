@@ -16,6 +16,8 @@
 package com.netflix.spectator.prometheus;
 
 import com.netflix.spectator.api.*;
+import com.netflix.spectator.api.patterns.PolledMeter;
+import com.netflix.spectator.impl.StepDouble;
 import io.prometheus.client.SimpleCollector;
 
 /**
@@ -62,7 +64,11 @@ public class PrometheusRegistry extends AbstractRegistry {
 
     @Override
     protected Gauge newMaxGauge(Id id) {
-        return new PrometheusGauge(clock(), id, build(io.prometheus.client.Gauge.build(), id)); // FIXME this is incorrect behaviour. Unfortunatelly it's hard to implement a proper MaxGauge with prometheus.
+        // Note: prometheus doesn't support this type directly so it uses an arbitrary
+        // window of 1m
+        StepDouble value = new StepDouble(Double.NaN, clock(), 60000L);
+        PolledMeter.using(this).withId(id).monitorValue(value.getCurrent());
+        return new PrometheusMaxGauge(clock(), id, value);
     }
 
     private <B extends SimpleCollector.Builder<B, C>, C extends SimpleCollector<D>, D> D build(B builder, Id id) {
